@@ -1,0 +1,3 @@
+[submodule "honeycomb-3d"]
+	path = honeycomb-3d
+	url = git@github.com:prismaticbridge/honeycomb-3d.git
