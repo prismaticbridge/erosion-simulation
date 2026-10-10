@@ -1,6 +1,7 @@
 mod application;
 mod bridge;
 mod bridge_data;
+mod terrain;
 use crate::bridge::App;
 use winit::error::EventLoopError;
 use winit::event_loop::EventLoop;

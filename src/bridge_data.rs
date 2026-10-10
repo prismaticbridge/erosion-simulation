@@ -1,10 +1,11 @@
 use std::sync::Mutex;
 
-use glam::{Mat4, Vec3};
+use glam::{Mat4, Quat, Vec3};
 use winit::{event::ElementState, keyboard::KeyCode};
 
 pub enum Event {
     Key((KeyCode, ElementState)),
+    MouseMotion((f64, f64)),
     Stop,
 }
 
@@ -18,18 +19,15 @@ pub struct SharedInputOutput {
 /// CPU-side render data computed by the update thread each tick.
 /// The main thread drains this at the start of each frame.
 pub struct RenderState {
-    pub player_state: PlayerState,
+    pub camera_state: CameraState,
     pub active_scene: usize,
     pub scenes: Vec<SceneState>,
     pub dirty: bool,
 }
 
-pub struct PlayerState {
-    pub player_position: Vec3,
-    // renderer handles for the player object — constant after init
-    pub player_material: usize,
-    pub player_mesh: usize,
-    pub player_object: usize,
+pub struct CameraState {
+    pub position: Vec3,
+    pub orientation: Quat,
     pub dirty: bool,
 }
 
@@ -57,12 +55,10 @@ pub struct SceneState {
 impl RenderState {
     pub fn new() -> Self {
         Self {
-            player_state: PlayerState {
-                player_position: Vec3::ZERO,
-                player_material: 0,
-                player_mesh: 0,
-                player_object: 0,
-                dirty: false,
+            camera_state: CameraState {
+                position: Vec3::ZERO,
+                orientation: Quat::IDENTITY,
+                dirty: true,
             },
             scenes: Vec::new(),
             active_scene: 0,

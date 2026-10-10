@@ -8,7 +8,7 @@ use glam::Vec2;
 use honeycomb_3d::Renderer;
 use winit::{
     application::ApplicationHandler,
-    event::{KeyEvent, WindowEvent},
+    event::{DeviceEvent, KeyEvent, WindowEvent},
     event_loop::ActiveEventLoop,
     keyboard::PhysicalKey,
     window::Window,
@@ -61,17 +61,13 @@ impl State {
             self.renderer.set_active_scene(active_scene);
             render_state.dirty = false;
         }
-        if render_state.player_state.dirty {
-            self.renderer.set_interpolated_target_position(
-                render_state.player_state.player_material,
-                render_state.player_state.player_mesh,
-                render_state.player_state.player_object,
-                render_state.player_state.player_position,
+        if render_state.camera_state.dirty {
+            self.renderer.update_camera_transform(
+                &render_state.camera_state.position,
+                &render_state.camera_state.orientation,
                 ANIMATION_TIME,
             );
-            render_state.player_state.dirty = false;
         }
-
         //drain events first to avoid holding a borrow
         let requests: Vec<_> = render_state.scenes[active_scene]
             .new_object_requests
@@ -118,6 +114,8 @@ impl ApplicationHandler for App {
             let mut renderer = pollster::block_on(Renderer::new(event_loop));
 
             let window = Arc::clone(&renderer.window);
+            let _ = window.set_cursor_grab(winit::window::CursorGrabMode::Locked);
+            window.set_cursor_visible(false);
 
             let shared_io = Arc::new(SharedInputOutput {
                 render_state: std::sync::Mutex::new(RenderState::new()),
@@ -160,6 +158,25 @@ impl ApplicationHandler for App {
                 window,
                 renderer,
             })
+        }
+    }
+
+    fn device_event(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        device_id: winit::event::DeviceId,
+        event: winit::event::DeviceEvent,
+    ) {
+        let Some(state) = &mut self.state else {
+            return;
+        };
+        match event {
+            DeviceEvent::MouseMotion { delta } => {
+                if let Ok(mut events) = state.shared_io.input_events.lock() {
+                    events.push(Event::MouseMotion(delta));
+                }
+            }
+            _ => {}
         }
     }
 
@@ -212,6 +229,10 @@ impl ApplicationHandler for App {
                     Err(_) => eprintln!("Surface error"),
                 }
             }
+            WindowEvent::CursorMoved {
+                device_id,
+                position,
+            } => {}
             WindowEvent::KeyboardInput {
                 event:
                     KeyEvent {
