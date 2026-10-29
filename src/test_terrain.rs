@@ -54,6 +54,7 @@ impl ApplicationHandler for App {
             };
 
             let gpu = renderer.get_gpu_context();
+            println!("enabled features: {}", gpu.device.features());
             let terrain_gen = TerrainGenContext::new(&gpu);
             let mut command_encoder =
                 gpu.device
