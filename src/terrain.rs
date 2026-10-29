@@ -58,6 +58,7 @@ pub const CUBE_INDICES: [u16; 36] = [
 const CHUNK_SIZE: u32 = 512; // texture width/height in texels for one terrain chunk
 const PAD_SIZE: u32 = 128;
 const WORKGROUP_SIZE: u32 = 16;
+const TERRAIN_GEN_ITERATIONS: u32 = 512;
 
 const SHADER_DIRECTORY: LazyLock<PathBuf> = LazyLock::new(|| {
     if let Some(manifest_dir) = option_env!("CARGO_MANIFEST_DIR") {
@@ -84,8 +85,8 @@ pub struct TerrainGenContext {
     water_sediment_textures: [wgpu::Texture; 2],
     gradient_texture: wgpu::Texture,
 
-    heightmap_index: u8,
-    water_sediment_index: u8,
+    // heightmap_index: u8,
+    // water_sediment_index: u8,
     texture_size: wgpu::Extent3d,
 }
 
@@ -108,12 +109,83 @@ fn create_2d_texture(
     })
 }
 
+/// Generates a random 0..=1 noise field, box-blurs it by `blur_radius` texels
+/// (wrapping at the edges so the result stays tileable) and uploads it to a new
+/// `R32Float` texture, ready to be used as the rain source.
+pub fn create_noise_texture(
+    gpu: &GpuContext,
+    size: wgpu::Extent3d,
+    blur_radius: u32,
+) -> wgpu::Texture {
+    let width = size.width as usize;
+    let height = size.height as usize;
+
+    // White noise from a cheap LCG, so we don't need a rand dependency.
+    let mut state: u32 = 0x1234_5678;
+    let mut noise = vec![0.0f32; width * height];
+    for value in &mut noise {
+        state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        *value = (state >> 8) as f32 / (1u32 << 24) as f32;
+    }
+
+    // Separable box blur: horizontal pass into `tmp`, vertical pass into `blurred`.
+    let radius = blur_radius as isize;
+    let kernel = (2 * radius + 1) as f32;
+    let mut tmp = vec![0.0f32; noise.len()];
+    let mut blurred = vec![0.0f32; noise.len()];
+    for y in 0..height {
+        for x in 0..width {
+            let mut sum = 0.0;
+            for dx in -radius..=radius {
+                let sx = (x as isize + dx).rem_euclid(width as isize) as usize;
+                sum += noise[y * width + sx];
+            }
+            tmp[y * width + x] = sum / kernel;
+        }
+    }
+    for y in 0..height {
+        for x in 0..width {
+            let mut sum = 0.0;
+            for dy in -radius..=radius {
+                let sy = (y as isize + dy).rem_euclid(height as isize) as usize;
+                sum += tmp[sy * width + x];
+            }
+            blurred[y * width + x] = sum / kernel;
+        }
+    }
+
+    let texture = create_2d_texture(
+        &gpu.device,
+        "rain noise",
+        size,
+        wgpu::TextureFormat::R32Float,
+        wgpu::TextureUsages::STORAGE_BINDING
+            | wgpu::TextureUsages::TEXTURE_BINDING
+            | wgpu::TextureUsages::COPY_DST,
+    );
+
+    let bytes: Vec<u8> = blurred.iter().flat_map(|v| v.to_le_bytes()).collect();
+    gpu.queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: &texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        &bytes,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(size.width * size_of::<f32>() as u32),
+            rows_per_image: Some(size.height),
+        },
+        size,
+    );
+
+    texture
+}
+
 impl TerrainGenContext {
     /// First render pass does the following:
-    /// Computes sobel gradients, normalizes them
-    /// Offsets coordinates by gradient and calculate delta height from that location
-    /// Calculates velocity and sediment capacity
-    /// Deposits sediment
     ///
     /// `new` allocates every GPU object the pass needs: the 5 textures, the
     /// sampler, the bind group, and the compute pipeline. Textures are
@@ -202,15 +274,7 @@ impl TerrainGenContext {
                     cache: Default::default(),
                 });
 
-        let rain_texture = create_2d_texture(
-            &gpu.device,
-            "rain texture",
-            texture_size,
-            wgpu::TextureFormat::R32Float,
-            wgpu::TextureUsages::STORAGE_BINDING
-                | wgpu::TextureUsages::TEXTURE_BINDING
-                | wgpu::TextureUsages::COPY_DST,
-        );
+        let rain_texture = create_noise_texture(gpu, texture_size, 1);
 
         let water_sediment_textures = [
             create_2d_texture(
@@ -240,6 +304,10 @@ impl TerrainGenContext {
         let rain_view = rain_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
         // SECOND SHADER PASS
+        // Computes sobel gradients, normalizes them
+        // Offsets coordinates by gradient and calculate delta height from that location
+        // Calculates velocity and sediment capacity
+        // Deposits sediment
         // NOTE: R32Float/Rg32Float are *unfilterable*, so the sampled textures
         // use `Float { filterable: false }` with a `NonFiltering` sampler.
         // Switching the heightmap to a filterable format (e.g. R16Float) would
@@ -497,6 +565,7 @@ impl TerrainGenContext {
         Self {
             sobel_pipeline,
             accumulate_pipeline,
+            advect_pipeline,
             rain_bind_group,
             sobel_bind_group,
             water_sediment_bind_groups,
@@ -505,8 +574,8 @@ impl TerrainGenContext {
             heightmap_textures,
             water_sediment_textures,
             gradient_texture,
-            heightmap_index: 0,
-            water_sediment_index: 0,
+            // heightmap_index: 0,
+            // water_sediment_index: 0,
             texture_size,
         }
     }
@@ -518,16 +587,47 @@ impl TerrainGenContext {
         )
     }
 
-    /// Records the first (sobel/erosion) pass into `encoder`.
-    /// Upload height/water/sediment data with `queue.write_texture` first.
-    pub fn run_first_pass(&self, encoder: &mut wgpu::CommandEncoder) {
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("sobel first pass"),
-            timestamp_writes: None,
-        });
-        pass.set_pipeline(&self.sobel_pipeline);
-        pass.set_bind_group(0, &self.sobel_bind_group, &[]);
-        let (dx, dy) = self.dispatch_workgroups();
-        pass.dispatch_workgroups(dx, dy, 1);
+    pub fn run_chunk_generation(&self, encoder: &mut wgpu::CommandEncoder) {
+        let mut pass = encoder.begin_compute_pass(&Default::default());
+        let workgroup_dispatch_counts = self.dispatch_workgroups();
+        //bind group 0 rain never changes
+        pass.set_bind_group(0, Some(&self.rain_bind_group), &[]);
+        //bind group 1 sobel gradients never changes
+        pass.set_bind_group(1, Some(&self.sobel_bind_group), &[]);
+        //bind group 2 changes on erosion shader, 3 on advection shader
+        //So rebind them when needed
+        let mut heightmap_index = 0;
+        pass.set_bind_group(2, Some(&self.heightmap_bind_groups[heightmap_index]), &[]);
+        let mut water_sediment_index = 0;
+        pass.set_bind_group(
+            3,
+            Some(&self.water_sediment_bind_groups[water_sediment_index]),
+            &[],
+        );
+        for i in 0..TERRAIN_GEN_ITERATIONS {
+            //accumulate flips water/sediment textures
+            pass.set_pipeline(&self.accumulate_pipeline);
+            pass.dispatch_workgroups(workgroup_dispatch_counts.0, workgroup_dispatch_counts.1, 1);
+            water_sediment_index = 1 - water_sediment_index;
+            pass.set_bind_group(
+                3,
+                Some(&self.water_sediment_bind_groups[water_sediment_index]),
+                &[],
+            );
+
+            pass.set_pipeline(&self.sobel_pipeline);
+            pass.dispatch_workgroups(workgroup_dispatch_counts.0, workgroup_dispatch_counts.1, 1);
+            heightmap_index = 1 - heightmap_index;
+            pass.set_bind_group(2, Some(&self.heightmap_bind_groups[heightmap_index]), &[]);
+
+            pass.set_pipeline(&self.advect_pipeline);
+            pass.dispatch_workgroups(workgroup_dispatch_counts.0, workgroup_dispatch_counts.1, 1);
+            water_sediment_index = 1 - water_sediment_index;
+            pass.set_bind_group(
+                3,
+                Some(&self.water_sediment_bind_groups[water_sediment_index]),
+                &[],
+            );
+        }
     }
 }

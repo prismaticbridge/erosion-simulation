@@ -1,15 +1,14 @@
 //sobel is calculated once and stored, so no pingpong
 //this also represents the velocity
-@group(0) @binding(0) var sobel_gradients: texture_storage_2d<rg32float, write>; // normalized
+@group(1) @binding(0) var sobel_gradients: texture_storage_2d<rg32float, write>; // normalized
 //sample and write height in this shader, so need pingpong
-@group(1) @binding(0) var heightmap: texture_2d<f32>;
-@group(1) @binding(1) var heightmap_sampler: sampler;
-@group(1) @binding(2) var write_heightmap: texture_storage_2d<r32float, write>;
-
+@group(2) @binding(0) var heightmap: texture_2d<f32>;
+@group(2) @binding(1) var heightmap_sampler: sampler;
+@group(2) @binding(2) var write_heightmap: texture_storage_2d<r32float, write>;
 //water and sediment get flipped in a different shader, so separate group
-@group(2) @binding(0) var water_sediment: texture_2d<f32>;
-@group(2) @binding(1) var write_water_sediment: texture_storage_2d<rg32float, write>;
-
+//In this shader they only get read from
+@group(3) @binding(0) var water_sediment: texture_2d<f32>;
+@group(3) @binding(1) var write_water_sediment: texture_storage_2d<rg32float, write>;
 
 const MIN_HEIGHT_DELTA: f32 = 0.06;
 const SEDIMENT_CAPACITY: f32 = 50.0;

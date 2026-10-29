@@ -1,6 +1,6 @@
-@group(0) @binding(0) var velocity: texture_storage_2d<rg32float, read>;
-@group(1) @binding(0) var water_sediment: texture_storage_2d<rg32float, read>;
-@group(1) @binding(1) var write_water_sediment: texture_storage_2d<rg32float, write>;
+@group(1) @binding(0) var velocity: texture_storage_2d<rg32float, read>;
+@group(3) @binding(0) var water_sediment: texture_storage_2d<rg32float, read>;
+@group(3) @binding(1) var write_water_sediment: texture_storage_2d<rg32float, write>;
 
 // var<workgroup> shared_tile: array<array<vec2f, 18>, 18>;
 // TODO: workgroup cache optimization

@@ -15,8 +15,8 @@ use winit::{
 };
 
 use crate::{
-    application::Game,
     bridge_data::{Event, NewObjectEvent, RenderState, SharedInputOutput},
+    test_terrain::Game,
 };
 
 struct State {

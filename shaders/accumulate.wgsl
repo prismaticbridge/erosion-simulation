@@ -1,7 +1,7 @@
 // handles evaporation and rain
 @group(0) @binding(0) var rain: texture_storage_2d<r32float, read>;
-@group(1) @binding(0) var water_sediment: texture_2d<f32>;
-@group(1) @binding(1) var write_water_sediment: texture_storage_2d<rg32float, write>;
+@group(3) @binding(0) var water_sediment: texture_2d<f32>;
+@group(3) @binding(1) var write_water_sediment: texture_storage_2d<rg32float, write>;
 
 // TODO: this is basically nothing, tune it
 const EVAPORATION_RATE = 1.0 - 0.00004;
