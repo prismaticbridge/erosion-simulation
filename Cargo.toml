@@ -7,4 +7,5 @@ edition = "2024"
 glam = { version = "0.34.*", features = ["bytemuck"] }
 honeycomb-3d = { path = "./honeycomb-3d" }
 pollster = "1.0.1"
+wgpu = "30.0.1"
 winit = { version = "0.30.*", features = ["wayland"] }

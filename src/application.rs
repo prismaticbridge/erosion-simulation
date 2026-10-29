@@ -1,12 +1,13 @@
 use std::sync::Arc;
 
 use glam::{Quat, Vec3};
+use honeycomb_3d::GpuContext;
 use winit::{event::ElementState, keyboard::KeyCode};
 
 use crate::{
     bridge::UPDATE_HZ,
     bridge_data::{Event, SceneState, SharedInputOutput},
-    terrain::{CUBE_INDICES, CUBE_VERTICES},
+    terrain::{CUBE_INDICES, CUBE_VERTICES, TerrainGenContext},
 };
 
 //this is an upper bound
@@ -22,6 +23,9 @@ pub struct Game {
     keyboard_input: [bool; NUM_KEYCODES],
     camera_position: Vec3,
     camera_orientation: Quat,
+    terrain_generator: TerrainGenContext,
+    gpu_context: Arc<GpuContext>,
+    gpu_features: wgpu::Features,
 
     should_stop: bool,
 }
@@ -32,6 +36,8 @@ impl Game {
         if let Ok(mut rs) = shared_io.render_state.lock() {
             rs.scenes.push(SceneState::new());
         }
+        let gpu_context = renderer.get_gpu_context();
+        let gpu_features = renderer.enabled_features;
         Self {
             shared_io: Arc::clone(shared_io),
             keyboard_input: [false; NUM_KEYCODES],
@@ -41,6 +47,9 @@ impl Game {
                 z: -2.0,
             },
             camera_orientation: Quat::IDENTITY,
+            terrain_generator: TerrainGenContext::new(&gpu_context),
+            gpu_context,
+            gpu_features,
             should_stop: false,
         }
     }

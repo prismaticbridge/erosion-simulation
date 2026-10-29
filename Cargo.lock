@@ -784,6 +784,7 @@ dependencies = [
  "glam",
  "honeycomb-3d",
  "pollster",
+ "wgpu",
  "winit",
 ]
 

@@ -1,5 +1,5 @@
 use std::{
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
     thread::{JoinHandle, sleep},
     time::{Duration, Instant},
 };
@@ -32,6 +32,8 @@ pub const UPDATE_LOOP_DELAY: Duration = Duration::from_nanos(1_000_000_000 / UPD
 pub const ANIMATION_TIME: u64 = UPDATE_LOOP_DELAY.as_micros() as u64;
 pub static SCREEN_WIDTH: Mutex<u32> = Mutex::new(0);
 pub static SCREEN_HEIGHT: Mutex<u32> = Mutex::new(0);
+
+pub const REQUESTED_FEATURES: wgpu::Features = wgpu::Features::FLOAT32_FILTERABLE;
 
 // Not great for state to have functions but this was the most convenient place
 impl State {
@@ -111,7 +113,13 @@ impl App {
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.state.is_none() {
-            let mut renderer = pollster::block_on(Renderer::new(event_loop));
+            let result = pollster::block_on(Renderer::new(event_loop, &REQUESTED_FEATURES));
+            let mut renderer = match result {
+                Ok(renderer) => renderer,
+                Err(features) => pollster::block_on(Renderer::new(event_loop, &features)).expect(
+                    "Failed to create renderer with features that are supposed to be supported",
+                ),
+            };
 
             let window = Arc::clone(&renderer.window);
             let _ = window.set_cursor_grab(winit::window::CursorGrabMode::Locked);
