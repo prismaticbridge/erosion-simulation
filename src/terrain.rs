@@ -1,7 +1,13 @@
-use std::{fmt::format, path::PathBuf, sync::LazyLock};
+use std::{
+    fmt::format,
+    num::NonZeroU32,
+    path::PathBuf,
+    sync::{Arc, LazyLock},
+};
 
 use honeycomb_3d::{GpuContext, vertex::Vertex};
-use wgpu::{BindGroupLayoutEntry, ShaderModuleDescriptor};
+use image::{ImageBuffer, Rgb, RgbaImage};
+use wgpu::{BindGroupLayoutEntry, ShaderModuleDescriptor, SubmissionIndex};
 
 #[rustfmt::skip]
 pub const CUBE_VERTICES: [Vertex; 8] = [
@@ -55,8 +61,8 @@ pub const CUBE_INDICES: [u16; 36] = [
     4, 7, 6
 ];
 
-const CHUNK_SIZE: u32 = 512; // texture width/height in texels for one terrain chunk
-const PAD_SIZE: u32 = 128;
+pub const CHUNK_SIZE: u32 = 512; // texture width/height in texels for one terrain chunk
+pub const PAD_SIZE: u32 = 128;
 const WORKGROUP_SIZE: u32 = 16;
 const TERRAIN_GEN_ITERATIONS: u32 = 512;
 
@@ -87,7 +93,9 @@ pub struct TerrainGenContext {
     heightmap_textures: [wgpu::Texture; 2],
     water_sediment_textures: [wgpu::Texture; 2],
 
-    // heightmap_index: u8,
+    temp_buffer: Option<wgpu::Buffer>,
+    gpu: Arc<GpuContext>,
+
     // water_sediment_index: u8,
     texture_size: wgpu::Extent3d,
 }
@@ -109,6 +117,169 @@ fn create_2d_texture(
         usage,
         view_formats: &[],
     })
+}
+
+struct OutputBufferDimensions {
+    bytes_per_pixel: u32,
+    padded_bytes_per_row: u32,
+    buffer_size: u32,
+    width: u32,
+    height: u32,
+}
+
+fn get_buffer_dimensions(texture: &wgpu::Texture) -> OutputBufferDimensions {
+    let bytes_per_pixel = texture
+        .format()
+        .target_pixel_byte_cost()
+        .expect("Cannot get pixels per byte for a texture");
+    let unpadded_bytes_per_row = texture.width() * bytes_per_pixel;
+    let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+    let padded_bytes_per_row = (unpadded_bytes_per_row + align - 1) & !(align - 1);
+    let buffer_size = texture.height() * padded_bytes_per_row;
+
+    OutputBufferDimensions {
+        bytes_per_pixel,
+        padded_bytes_per_row,
+        buffer_size,
+        width: texture.width(),
+        height: texture.height(),
+    }
+}
+
+fn read_to_buffer(
+    texture: &wgpu::Texture,
+    output_buffer: &mut wgpu::Buffer,
+    dimensions: &OutputBufferDimensions,
+    encoder: &mut wgpu::CommandEncoder,
+) {
+    encoder.copy_texture_to_buffer(
+        wgpu::TexelCopyTextureInfoBase {
+            texture: texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::TexelCopyBufferInfoBase {
+            buffer: output_buffer,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(dimensions.padded_bytes_per_row),
+                rows_per_image: Some(dimensions.height),
+            },
+        },
+        wgpu::Extent3d {
+            width: dimensions.width,
+            height: dimensions.height,
+            depth_or_array_layers: 1,
+        },
+    );
+}
+
+fn read_to_cpu(
+    buffer: &wgpu::Buffer,
+    cpu_dest: &mut Vec<u8>,
+    device: &wgpu::Device,
+    submission_index: SubmissionIndex,
+    dimensions: &OutputBufferDimensions,
+) {
+    let slice = buffer.slice(..);
+    let (tx, rx) = std::sync::mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |result| {
+        tx.send(result).unwrap();
+    });
+
+    let _ = device
+        .poll(wgpu::PollType::Wait {
+            submission_index: Some(submission_index),
+            timeout: None,
+        })
+        .inspect_err(|e| eprintln!("Failed to poll device: {e}"));
+
+    if rx.recv().is_ok() {
+        if let Ok(read_data_slice) = slice.get_mapped_range() {
+            let unpadded_bytes_per_row = dimensions.width * dimensions.bytes_per_pixel;
+            for chunk in read_data_slice.chunks(dimensions.padded_bytes_per_row as usize) {
+                cpu_dest.extend_from_slice(&chunk[..unpadded_bytes_per_row as usize]);
+            }
+        }
+        buffer.unmap();
+    } else {
+        eprintln!("Error: failed to read data from gpu buffer");
+    }
+}
+
+pub fn save_texture_to_file(
+    texture: &wgpu::Texture,
+    file: &str,
+    mut encoder: wgpu::CommandEncoder,
+    gpu: &GpuContext,
+    channels: u32,
+) {
+    let output_buffer_dimensions = get_buffer_dimensions(&texture);
+    //allocate a buffer of the correct size
+    let mut temp_buffer = gpu.device.create_buffer(&wgpu::wgt::BufferDescriptor {
+        label: None,
+        size: output_buffer_dimensions.buffer_size as u64,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    //finish the compute pass
+    read_to_buffer(
+        &texture,
+        &mut temp_buffer,
+        &output_buffer_dimensions,
+        &mut encoder,
+    );
+    let mut output_data = Vec::with_capacity(
+        (output_buffer_dimensions.width
+            * output_buffer_dimensions.height
+            * output_buffer_dimensions.bytes_per_pixel) as usize,
+    );
+    let submission_index = gpu.queue.submit(Some(encoder.finish()));
+    read_to_cpu(
+        &mut temp_buffer,
+        &mut output_data,
+        &gpu.device,
+        submission_index,
+        &output_buffer_dimensions,
+    );
+
+    let output_format = match channels {
+        1 => image::ExtendedColorType::L8,
+        _ => image::ExtendedColorType::Rgb8,
+    };
+
+    let output_floats: &[f32] = bytemuck::cast_slice(&output_data);
+
+    let mut img = ImageBuffer::new(
+        output_buffer_dimensions.width,
+        output_buffer_dimensions.height,
+    );
+    match channels {
+        1 => {
+            for (i, pixel) in img.pixels_mut().enumerate() {
+                let r = (output_floats[i] * 255.0).clamp(0.0, 255.0) as u8;
+                *pixel = Rgb([r, 0, 0]); // G and B padded with 0
+            }
+        }
+        2 => {
+            for (i, pixel) in img.pixels_mut().enumerate() {
+                let r = (output_floats[i * 2] * 255.0).clamp(0.0, 255.0) as u8;
+                let g = (output_floats[i * 2 + 1] * 255.0).clamp(0.0, 255.0) as u8;
+                *pixel = Rgb([r, g, 0]); // B padded with 0
+            }
+        }
+        _ => {
+            for (i, pixel) in img.pixels_mut().enumerate() {
+                let r = (output_floats[i * 3] * 255.0).clamp(0.0, 255.0) as u8;
+                let g = (output_floats[i * 3 + 1] * 255.0).clamp(0.0, 255.0) as u8;
+                let b = (output_floats[i * 3 + 2] * 255.0).clamp(0.0, 255.0) as u8;
+                *pixel = Rgb([r, g, b]);
+            }
+        }
+    }
+
+    img.save(file);
 }
 
 /// Generates a random 0..=1 noise field, box-blurs it by `blur_radius` texels
@@ -163,7 +334,8 @@ pub fn create_noise_texture(
         wgpu::TextureFormat::R32Float,
         wgpu::TextureUsages::STORAGE_BINDING
             | wgpu::TextureUsages::TEXTURE_BINDING
-            | wgpu::TextureUsages::COPY_DST,
+            | wgpu::TextureUsages::COPY_DST
+            | wgpu::TextureUsages::COPY_SRC, // TODO: remove this
     );
 
     let bytes: Vec<u8> = blurred.iter().flat_map(|v| v.to_le_bytes()).collect();
@@ -194,7 +366,7 @@ impl TerrainGenContext {
     /// zero-initialized by wgpu; the caller uploads real heights with
     /// `queue.write_texture(&heightmap_texture, ...)` before dispatching.
     /// See [`Self::run_first_pass`].
-    pub fn new(gpu: &GpuContext) -> Self {
+    pub fn new(gpu: Arc<GpuContext>) -> Self {
         let texture_size = wgpu::Extent3d {
             width: CHUNK_SIZE,
             height: CHUNK_SIZE,
@@ -432,14 +604,16 @@ impl TerrainGenContext {
                     cache: Default::default(),
                 });
 
-        let rain_texture = create_noise_texture(gpu, texture_size, 1);
+        let rain_texture = create_noise_texture(&gpu, texture_size, 1);
 
         let gradient_texture = create_2d_texture(
             &gpu.device,
             "sobel gradients",
             texture_size,
             wgpu::TextureFormat::Rg32Float,
-            wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
+            wgpu::TextureUsages::STORAGE_BINDING
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC, // TODO remove COPY_SRC
         );
 
         let heightmap_textures = [
@@ -620,8 +794,8 @@ impl TerrainGenContext {
             gradient_texture,
             heightmap_textures,
             water_sediment_textures,
-            // heightmap_index: 0,
-            // water_sediment_index: 0,
+            temp_buffer: None,
+            gpu,
             texture_size,
         }
     }
@@ -633,7 +807,68 @@ impl TerrainGenContext {
         )
     }
 
-    pub fn run_chunk_generation(&self, encoder: &mut wgpu::CommandEncoder) {
+    pub fn save_everything(&self) {
+        let encoder = self
+            .gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        save_texture_to_file(&self.rain_texture, "rain.png", encoder, &self.gpu, 1);
+
+        let encoder = self
+            .gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        save_texture_to_file(&self.gradient_texture, "rain.png", encoder, &self.gpu, 2);
+
+        let encoder = self
+            .gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        save_texture_to_file(
+            &self.heightmap_textures[0],
+            "heightmap_0.png",
+            encoder,
+            &self.gpu,
+            1,
+        );
+
+        let encoder = self
+            .gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        save_texture_to_file(
+            &self.heightmap_textures[1],
+            "heightmap_1.png",
+            encoder,
+            &self.gpu,
+            1,
+        );
+
+        let encoder = self
+            .gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        save_texture_to_file(
+            &self.water_sediment_textures[0],
+            "water_0.png",
+            encoder,
+            &self.gpu,
+            1,
+        );
+        let encoder = self
+            .gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        save_texture_to_file(
+            &self.water_sediment_textures[1],
+            "water_1.png",
+            encoder,
+            &self.gpu,
+            1,
+        );
+    }
+
+    pub fn run_chunk_generation(&mut self, mut encoder: wgpu::CommandEncoder) -> Vec<f32> {
         let mut pass = encoder.begin_compute_pass(&Default::default());
         let workgroup_dispatch_counts = self.dispatch_workgroups();
         //bind group 0 rain never changes
@@ -664,14 +899,14 @@ impl TerrainGenContext {
             //erosion samples from heightmap and then writes, so flip
             //writes to sobels but can be overwritten, so no flip
             pass.set_pipeline(&self.erosion_pipeline);
-            pass.set_bind_group(1, Some(&self.sobel_read_bind_group), &[]);
+            pass.set_bind_group(1, Some(&self.sobel_write_bind_group), &[]);
             pass.dispatch_workgroups(workgroup_dispatch_counts.0, workgroup_dispatch_counts.1, 1);
             heightmap_index = 1 - heightmap_index;
             pass.set_bind_group(2, Some(&self.heightmap_bind_groups[heightmap_index]), &[]);
 
             //advection reads velocity (no flip) and samples and writes to water/sediment (flip)
             pass.set_pipeline(&self.advect_pipeline);
-            pass.set_bind_group(1, Some(&self.sobel_write_bind_group), &[]);
+            pass.set_bind_group(1, Some(&self.sobel_read_bind_group), &[]);
             pass.dispatch_workgroups(workgroup_dispatch_counts.0, workgroup_dispatch_counts.1, 1);
             water_sediment_index = 1 - water_sediment_index;
             pass.set_bind_group(
@@ -680,5 +915,47 @@ impl TerrainGenContext {
                 &[],
             );
         }
+
+        //get last written heightmap
+        //heightmap index corresponds to the read handle, so flip to get write handle
+        heightmap_index = 1 - heightmap_index;
+        let output_buffer_dimensions =
+            get_buffer_dimensions(&self.heightmap_textures[heightmap_index]);
+        //allocate a buffer of the correct size
+        if self.temp_buffer.is_none()
+            || self.temp_buffer.as_ref().unwrap().size()
+                < output_buffer_dimensions.buffer_size as u64
+        {
+            self.temp_buffer = Some(self.gpu.device.create_buffer(&wgpu::wgt::BufferDescriptor {
+                label: None,
+                size: output_buffer_dimensions.buffer_size as u64,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }));
+        }
+        //finish the compute pass
+        drop(pass);
+        read_to_buffer(
+            &self.heightmap_textures[heightmap_index],
+            self.temp_buffer.as_mut().unwrap(),
+            &output_buffer_dimensions,
+            &mut encoder,
+        );
+        let mut output_data = Vec::with_capacity(
+            (output_buffer_dimensions.width
+                * output_buffer_dimensions.height
+                * output_buffer_dimensions.bytes_per_pixel) as usize,
+        );
+        let submission_index = self.gpu.queue.submit(Some(encoder.finish()));
+        read_to_cpu(
+            self.temp_buffer.as_mut().unwrap(),
+            &mut output_data,
+            &self.gpu.device,
+            submission_index,
+            &output_buffer_dimensions,
+        );
+
+        let float_slice: &[f32] = bytemuck::cast_slice(&output_data);
+        return float_slice.to_vec();
     }
 }

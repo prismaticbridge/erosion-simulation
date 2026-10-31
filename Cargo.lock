@@ -781,8 +781,10 @@ dependencies = [
 name = "graphics-demo"
 version = "0.1.0"
 dependencies = [
+ "bytemuck",
  "glam",
  "honeycomb-3d",
+ "image",
  "pollster",
  "wgpu",
  "winit",

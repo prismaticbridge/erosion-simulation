@@ -4,8 +4,10 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+bytemuck = "1.25.2"
 glam = { version = "0.34.*", features = ["bytemuck"] }
 honeycomb-3d = { path = "./honeycomb-3d" }
+image = "0.25.10"
 pollster = "1.0.1"
 wgpu = "30.0.1"
 winit = { version = "0.30.*", features = ["wayland"] }
