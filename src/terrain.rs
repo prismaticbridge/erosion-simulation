@@ -1,70 +1,23 @@
 use std::{
-    fmt::format,
-    num::NonZeroU32,
     path::PathBuf,
     sync::{Arc, LazyLock},
 };
 
-use honeycomb_3d::{GpuContext, vertex::Vertex};
-use image::{ImageBuffer, Rgb, RgbaImage};
-use wgpu::{BindGroupLayoutEntry, ShaderModuleDescriptor, SubmissionIndex};
-
-#[rustfmt::skip]
-pub const CUBE_VERTICES: [Vertex; 8] = [
-    Vertex {
-        position: [-0.5, -0.5, -0.5],
-        color: [0.0, 0.0, 0.0],
-    },
-    Vertex {
-        position: [0.5, -0.5, -0.5],
-        color: [1.0, 0.0, 0.0],
-    },
-    Vertex {
-        position: [0.5, 0.5, -0.5],
-        color: [1.0, 1.0, 0.0],
-    },
-    Vertex {
-        position: [-0.5, 0.5, -0.5],
-        color: [0.0, 1.0, 0.0],
-    },
-    Vertex {
-        position: [-0.5, -0.5, 0.5],
-        color: [0.0, 0.0, 1.0],
-    },
-    Vertex {
-        position: [0.5, -0.5, 0.5],
-        color: [0.0, 0.0, 1.0],
-    },
-    Vertex {
-        position: [0.5, 0.5, 0.5],
-        color: [1.0, 1.0, 1.0],
-    },
-    Vertex {
-        position: [-0.5, 0.5, 0.5],
-        color: [0.0, 1.0, 1.0],
-    }
-];
-
-#[rustfmt::skip]
-pub const CUBE_INDICES: [u16; 36] = [
-    0, 1, 2,
-    0, 2, 3,
-    1, 5, 6,
-    1, 6, 2,
-    3, 2, 6,
-    3, 6, 7,
-    3, 7, 4,
-    3, 4, 0,
-    0, 4, 5,
-    0, 5, 1,
-    4, 6, 5,
-    4, 7, 6
-];
+use bytemuck::NoUninit;
+use honeycomb_3d::GpuContext;
+use image::{ImageBuffer, Rgb};
+use noise::{NoiseFn, Perlin};
+use wgpu::{ShaderModuleDescriptor, SubmissionIndex};
 
 pub const CHUNK_SIZE: u32 = 512; // texture width/height in texels for one terrain chunk
 pub const PAD_SIZE: u32 = 128;
 const WORKGROUP_SIZE: u32 = 16;
 const TERRAIN_GEN_ITERATIONS: u32 = 512;
+
+// Fractional brownian motion parameters for initial heightmap generation
+const FBM_RESOLUTION: u32 = 8;
+const FBM_OCTAVES: u32 = 6;
+const FBM_PERSISTENCE: f64 = 0.5;
 
 const SHADER_DIRECTORY: LazyLock<PathBuf> = LazyLock::new(|| {
     if let Some(manifest_dir) = option_env!("CARGO_MANIFEST_DIR") {
@@ -119,7 +72,7 @@ fn create_2d_texture(
     })
 }
 
-struct OutputBufferDimensions {
+struct LayoutDimensions {
     bytes_per_pixel: u32,
     padded_bytes_per_row: u32,
     buffer_size: u32,
@@ -127,7 +80,7 @@ struct OutputBufferDimensions {
     height: u32,
 }
 
-fn get_buffer_dimensions(texture: &wgpu::Texture) -> OutputBufferDimensions {
+fn get_layout_dimensions(texture: &wgpu::Texture) -> LayoutDimensions {
     let bytes_per_pixel = texture
         .format()
         .target_pixel_byte_cost()
@@ -137,7 +90,7 @@ fn get_buffer_dimensions(texture: &wgpu::Texture) -> OutputBufferDimensions {
     let padded_bytes_per_row = (unpadded_bytes_per_row + align - 1) & !(align - 1);
     let buffer_size = texture.height() * padded_bytes_per_row;
 
-    OutputBufferDimensions {
+    LayoutDimensions {
         bytes_per_pixel,
         padded_bytes_per_row,
         buffer_size,
@@ -149,7 +102,7 @@ fn get_buffer_dimensions(texture: &wgpu::Texture) -> OutputBufferDimensions {
 fn read_to_buffer(
     texture: &wgpu::Texture,
     output_buffer: &mut wgpu::Buffer,
-    dimensions: &OutputBufferDimensions,
+    dimensions: &LayoutDimensions,
     encoder: &mut wgpu::CommandEncoder,
 ) {
     encoder.copy_texture_to_buffer(
@@ -180,7 +133,7 @@ fn read_to_cpu(
     cpu_dest: &mut Vec<u8>,
     device: &wgpu::Device,
     submission_index: SubmissionIndex,
-    dimensions: &OutputBufferDimensions,
+    dimensions: &LayoutDimensions,
 ) {
     let slice = buffer.slice(..);
     let (tx, rx) = std::sync::mpsc::channel();
@@ -215,7 +168,7 @@ pub fn save_texture_to_file(
     gpu: &GpuContext,
     channels: u32,
 ) {
-    let output_buffer_dimensions = get_buffer_dimensions(&texture);
+    let output_buffer_dimensions = get_layout_dimensions(&texture);
     //allocate a buffer of the correct size
     let mut temp_buffer = gpu.device.create_buffer(&wgpu::wgt::BufferDescriptor {
         label: None,
@@ -282,14 +235,39 @@ pub fn save_texture_to_file(
     img.save(file);
 }
 
-/// Generates a random 0..=1 noise field, box-blurs it by `blur_radius` texels
-/// (wrapping at the edges so the result stays tileable) and uploads it to a new
-/// `R32Float` texture, ready to be used as the rain source.
-pub fn create_noise_texture(
+/// Uploads the raw bytes of a slice to a gpu texture
+fn upload_to_texture<T: NoUninit>(
+    texture: &mut wgpu::Texture,
+    data: &[T],
     gpu: &GpuContext,
-    size: wgpu::Extent3d,
-    blur_radius: u32,
-) -> wgpu::Texture {
+    layout: LayoutDimensions,
+) {
+    let bytes = bytemuck::cast_slice(data);
+    gpu.queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        &bytes,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(layout.width * size_of::<T>() as u32),
+            rows_per_image: Some(layout.height),
+        },
+        wgpu::Extent3d {
+            width: layout.width,
+            height: layout.height,
+            depth_or_array_layers: 1,
+        },
+    );
+}
+
+/// Generates a random 0..=1 noise field, box-blurs it by `blur_radius` texels
+/// wraps at the edges so the result stays tileable
+/// uploads it to a new R32Float texture
+pub fn create_noise_map(size: wgpu::Extent3d, blur_radius: u32) -> Vec<f32> {
     let width = size.width as usize;
     let height = size.height as usize;
 
@@ -327,35 +305,56 @@ pub fn create_noise_texture(
         }
     }
 
-    let texture = create_2d_texture(
-        &gpu.device,
-        "rain noise",
-        size,
-        wgpu::TextureFormat::R32Float,
-        wgpu::TextureUsages::STORAGE_BINDING
-            | wgpu::TextureUsages::TEXTURE_BINDING
-            | wgpu::TextureUsages::COPY_DST
-            | wgpu::TextureUsages::COPY_SRC, // TODO: remove this
-    );
+    return blurred;
+}
 
-    let bytes: Vec<u8> = blurred.iter().flat_map(|v| v.to_le_bytes()).collect();
-    gpu.queue.write_texture(
-        wgpu::TexelCopyTextureInfo {
-            texture: &texture,
-            mip_level: 0,
-            origin: wgpu::Origin3d::ZERO,
-            aspect: wgpu::TextureAspect::All,
-        },
-        &bytes,
-        wgpu::TexelCopyBufferLayout {
-            offset: 0,
-            bytes_per_row: Some(size.width * size_of::<f32>() as u32),
-            rows_per_image: Some(size.height),
-        },
-        size,
-    );
+/// Generates an initial heightmap using Fractional Brownian Motion
+pub fn generate_chunkable_fbm(
+    shape: (u32, u32),
+    base_res: (u32, u32),
+    octaves: u32,
+    persistence: f64,
+) -> Vec<f32> {
+    let mut total = vec![0.0 as f32; (shape.0 * shape.1) as usize];
+    let mut amplitude = 1.0;
+    let mut total_amplitude = 0.0;
+    let mut freq_mult = 1;
 
-    texture
+    let seed: u32 = rand::random();
+    let perlin = Perlin::new(seed);
+
+    for _ in 0..octaves {
+        let res = (base_res.0 * freq_mult, base_res.1 * freq_mult);
+
+        // check that axes are divisible by resolution
+        if shape.0 % res.0 == 0 && shape.1 % res.1 == 0 {
+            for y in 0..shape.0 {
+                for x in 0..shape.1 {
+                    // Map coordinates to the frequency resolution scale
+                    let nx = (x as f64 / shape.1 as f64) * res.1 as f64;
+                    let ny = (y as f64 / shape.0 as f64) * res.0 as f64;
+                    let val = perlin.get([nx, ny]);
+
+                    let idx = (y * shape.1 + x) as usize;
+                    //graphics card needs f32
+                    total[idx] += (val * amplitude) as f32;
+                }
+            }
+            total_amplitude += amplitude;
+        }
+
+        amplitude *= persistence;
+        freq_mult *= 2;
+    }
+
+    // Normalize by total amplitude
+    if total_amplitude > 0.0 {
+        for val in total.iter_mut() {
+            *val /= total_amplitude as f32;
+        }
+    }
+
+    total
 }
 
 impl TerrainGenContext {
@@ -604,7 +603,21 @@ impl TerrainGenContext {
                     cache: Default::default(),
                 });
 
-        let rain_texture = create_noise_texture(&gpu, texture_size, 1);
+        let mut rain_texture = create_2d_texture(
+            &gpu.device,
+            "rain noise",
+            texture_size,
+            wgpu::TextureFormat::R32Float,
+            wgpu::TextureUsages::STORAGE_BINDING
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_DST
+                | wgpu::TextureUsages::COPY_SRC, // TODO: remove this
+        );
+        {
+            let noise = create_noise_map(texture_size, 1);
+            let layout = get_layout_dimensions(&rain_texture);
+            upload_to_texture(&mut rain_texture, &noise, &gpu, layout);
+        }
 
         let gradient_texture = create_2d_texture(
             &gpu.device,
@@ -616,7 +629,7 @@ impl TerrainGenContext {
                 | wgpu::TextureUsages::COPY_SRC, // TODO remove COPY_SRC
         );
 
-        let heightmap_textures = [
+        let mut heightmap_textures = [
             create_2d_texture(
                 &gpu.device,
                 "terrain heightmap",
@@ -638,6 +651,31 @@ impl TerrainGenContext {
                     | wgpu::TextureUsages::STORAGE_BINDING,
             ),
         ];
+        {
+            let initial_heightmap = generate_chunkable_fbm(
+                (CHUNK_SIZE, CHUNK_SIZE),
+                (FBM_RESOLUTION, FBM_RESOLUTION),
+                FBM_OCTAVES,
+                FBM_PERSISTENCE,
+            );
+            let layout = get_layout_dimensions(&heightmap_textures[0]);
+            // The first texture is read from, so heightmap should start in that one
+            // Second texture starts blank but the first erosion pass will update it
+            upload_to_texture(&mut heightmap_textures[0], &initial_heightmap, &gpu, layout);
+            //save initial heightmap
+            let heightmap_u8: Vec<u8> = initial_heightmap
+                .iter()
+                .map(|h| (h * 255.0) as u8)
+                .collect();
+            image::save_buffer(
+                "initial_heightmap.png",
+                &heightmap_u8,
+                CHUNK_SIZE,
+                CHUNK_SIZE,
+                image::ExtendedColorType::L8,
+            )
+            .expect("Failed to save initial heightmap");
+        }
 
         let water_sediment_textures = [
             create_2d_texture(
@@ -885,7 +923,7 @@ impl TerrainGenContext {
             Some(&self.water_sediment_bind_groups[water_sediment_index]),
             &[],
         );
-        for i in 0..TERRAIN_GEN_ITERATIONS {
+        for _i in 0..TERRAIN_GEN_ITERATIONS {
             //accumulate flips water/sediment textures
             pass.set_pipeline(&self.accumulate_pipeline);
             pass.dispatch_workgroups(workgroup_dispatch_counts.0, workgroup_dispatch_counts.1, 1);
@@ -920,7 +958,7 @@ impl TerrainGenContext {
         //heightmap index corresponds to the read handle, so flip to get write handle
         heightmap_index = 1 - heightmap_index;
         let output_buffer_dimensions =
-            get_buffer_dimensions(&self.heightmap_textures[heightmap_index]);
+            get_layout_dimensions(&self.heightmap_textures[heightmap_index]);
         //allocate a buffer of the correct size
         if self.temp_buffer.is_none()
             || self.temp_buffer.as_ref().unwrap().size()
