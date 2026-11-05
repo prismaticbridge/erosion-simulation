@@ -1,3 +1,7 @@
 /target
+# scripting stuff
 *.py
+__pycache__
+# debug images
+/heightmaps
 *.png
