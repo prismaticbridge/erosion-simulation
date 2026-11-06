@@ -4,7 +4,7 @@
 @group(3) @binding(0) var water_sediment: texture_2d<f32>;
 @group(3) @binding(1) var write_water_sediment: texture_storage_2d<rg32float, write>;
 
-const EVAPORATION_RATE: f32 = 0.0; //0.0004;
+const EVAPORATION_RATE: f32 = 0.0004;
 
 // var<workgroup> shared_tile: array<array<vec2f, 18>, 18>;
 // TODO: workgroup cache optimization

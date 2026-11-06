@@ -12,8 +12,8 @@
 
 const MIN_HEIGHT_DELTA: f32 = 0.06;
 const SEDIMENT_CAPACITY: f32 = 50.0;
-const DISSOLVE_RATE: f32 = 0.3;
-const DEPOSITION_RATE: f32 = 0.002;
+const DISSOLVE_RATE: f32 = 0.2; // 0.25
+const DEPOSITION_RATE: f32 = 0.001;
 const SOBEL_KERNEL = vec3f(1.0, 2.0, 1.0);
 const REPOSE_SLOPE: f32 = 1.0;
 

@@ -7,7 +7,8 @@ use winit::{event::ElementState, keyboard::KeyCode};
 use crate::{
     bridge::UPDATE_HZ,
     bridge_data::{Event, SceneState, SharedInputOutput},
-    terrain::{CUBE_INDICES, CUBE_VERTICES, TerrainGenContext},
+    chunk::{Chunk, WORLD_HEIGHT},
+    terraingen::TerrainGenContext,
 };
 
 //this is an upper bound
@@ -15,7 +16,7 @@ const NUM_KEYCODES: usize = 256;
 const MOUSE_MOVE_FACTOR: f64 = 0.001;
 const MOUSE_MOVE_THRESHOLD: f64 = 1e-8;
 
-const MOVEMENT_SPEED: f32 = 1.0;
+const MOVEMENT_SPEED: f32 = 10.0;
 const MOVEMENT_PER_TICK: f32 = MOVEMENT_SPEED / UPDATE_HZ as f32;
 
 pub struct Game {
@@ -32,22 +33,30 @@ pub struct Game {
 impl Game {
     pub fn new(shared_io: &Arc<SharedInputOutput>, renderer: &mut honeycomb_3d::Renderer) -> Self {
         let main_scene = renderer.create_scene();
-        renderer.add_static_object(main_scene, &CUBE_VERTICES, &CUBE_INDICES);
+        // renderer.add_static_object(main_scene, &CUBE_VERTICES, &CUBE_INDICES);
+        // if let Ok(mut rs) = shared_io.render_state.lock() {
+        //     rs.scenes.push(SceneState::new());
+        // }
+        let gpu_context = renderer.get_gpu_context();
+        let mut terrain_generator = TerrainGenContext::new(Arc::clone(&gpu_context));
+        let chunk_heightmap = terrain_generator.run_chunk_generation(None);
+        let terrain_chunk = Chunk::new(chunk_heightmap, 0, 0);
+        let (vertices, indices) = terrain_chunk.to_3d_geometry();
+        renderer.add_static_object(main_scene, &vertices, &indices);
         if let Ok(mut rs) = shared_io.render_state.lock() {
             rs.scenes.push(SceneState::new());
         }
-        let gpu_context = renderer.get_gpu_context();
         let gpu_features = renderer.enabled_features;
         Self {
             shared_io: Arc::clone(shared_io),
             keyboard_input: [false; NUM_KEYCODES],
             camera_position: Vec3 {
                 x: 0.0,
-                y: 0.0,
+                y: WORLD_HEIGHT,
                 z: -2.0,
             },
             camera_orientation: Quat::IDENTITY,
-            terrain_generator: TerrainGenContext::new(&gpu_context),
+            terrain_generator,
             gpu_context,
             gpu_features,
             should_stop: false,
@@ -102,16 +111,11 @@ impl Game {
         };
         if self.keyboard_input[KeyCode::KeyW as usize] {
             let forward_global = self.camera_orientation * FORWARD_LOCAL;
-            println!("{forward_global}");
             self.camera_position += forward_global * MOVEMENT_PER_TICK;
         }
         if self.keyboard_input[KeyCode::KeyS as usize] {
             let forward_global = self.camera_orientation * FORWARD_LOCAL;
-            // println!("the cart is moving back");
-            // println!("before: {}", self.camera_position);
-            println!("{forward_global}");
             self.camera_position -= forward_global * MOVEMENT_PER_TICK;
-            // println!("after: {}", self.camera_position);
         }
     }
 

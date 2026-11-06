@@ -1,21 +1,9 @@
-use std::{
-    sync::{Arc, Mutex, OnceLock},
-    thread::{JoinHandle, sleep},
-    time::{Duration, Instant},
-};
+use std::{sync::Arc, time::Instant};
 
-use glam::Vec2;
 use honeycomb_3d::Renderer;
-use image::ImageBuffer;
-use winit::{
-    application::ApplicationHandler,
-    event::{DeviceEvent, KeyEvent, WindowEvent},
-    event_loop::ActiveEventLoop,
-    keyboard::PhysicalKey,
-    window::Window,
-};
+use winit::{application::ApplicationHandler, event::WindowEvent, event_loop::ActiveEventLoop};
 
-use crate::terrain::{CHUNK_SIZE, TerrainGenContext};
+use crate::terrain::TerrainGenContext;
 
 struct State {
     renderer: Renderer,

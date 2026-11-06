@@ -5,19 +5,19 @@ use std::{
 
 use bytemuck::NoUninit;
 use honeycomb_3d::GpuContext;
-use image::{ImageBuffer, Rgb};
+use image::ImageBuffer;
 use noise::{NoiseFn, Perlin};
 use wgpu::{ShaderModuleDescriptor, SubmissionIndex};
 
-pub const CHUNK_SIZE: u32 = 512; // texture width/height in texels for one terrain chunk
-// pub const PAD_SIZE: u32 = 128;
+pub const CHUNK_SIZE: u32 = 128; // texture width/height in texels for one terrain chunk
+pub const PAD_SIZE: u32 = CHUNK_SIZE / 2;
 const WORKGROUP_SIZE: u32 = 16;
 const TERRAIN_GEN_ITERATIONS: u32 = 1024;
 
 // Fractional brownian motion parameters for initial heightmap generation
 const FBM_RESOLUTION: u32 = 4;
 const FBM_OCTAVES: u32 = 6;
-const FBM_PERSISTENCE: f64 = 0.5;
+const FBM_PERSISTENCE: f64 = 0.45;
 
 const SHADER_DIRECTORY: LazyLock<PathBuf> = LazyLock::new(|| {
     if let Some(manifest_dir) = option_env!("CARGO_MANIFEST_DIR") {
@@ -31,6 +31,7 @@ const SHADER_DIRECTORY: LazyLock<PathBuf> = LazyLock::new(|| {
 });
 
 pub struct TerrainGenContext {
+    // These are GPU objects required for chunk generation
     accumulate_pipeline: wgpu::ComputePipeline,
     erosion_pipeline: wgpu::ComputePipeline,
     advect_pipeline: wgpu::ComputePipeline,
@@ -41,10 +42,10 @@ pub struct TerrainGenContext {
     water_sediment_bind_groups: [wgpu::BindGroup; 2],
     //ping pong textures that are swapped every iteration
     //these aren't needed, but if they get dropped wgpu frees them and then the shaders all crash
-    rain_texture: wgpu::Texture,
-    gradient_texture: wgpu::Texture,
-    heightmap_textures: [wgpu::Texture; 2],
-    water_sediment_textures: [wgpu::Texture; 2],
+    _rain_texture: wgpu::Texture,
+    _gradient_texture: wgpu::Texture,
+    heightmap_textures: [wgpu::Texture; 2], // gets read at the end
+    _water_sediment_textures: [wgpu::Texture; 2],
 
     temp_buffer: Option<wgpu::Buffer>,
     gpu: Arc<GpuContext>,
@@ -72,7 +73,7 @@ fn create_2d_texture(
     })
 }
 
-struct LayoutDimensions {
+pub struct LayoutDimensions {
     bytes_per_pixel: u32,
     padded_bytes_per_row: u32,
     buffer_size: u32,
@@ -80,7 +81,7 @@ struct LayoutDimensions {
     height: u32,
 }
 
-fn get_layout_dimensions(texture: &wgpu::Texture) -> LayoutDimensions {
+pub fn get_layout_dimensions(texture: &wgpu::Texture) -> LayoutDimensions {
     let bytes_per_pixel = texture
         .format()
         .target_pixel_byte_cost()
@@ -161,12 +162,11 @@ fn read_to_cpu(
     }
 }
 
-pub fn save_texture_to_file(
+pub fn save_heightmap(
     texture: &wgpu::Texture,
     file: &str,
     mut encoder: wgpu::CommandEncoder,
     gpu: &GpuContext,
-    channels: u32,
 ) {
     let layout_dimensions = get_layout_dimensions(&texture);
     //allocate a buffer of the correct size
@@ -194,55 +194,40 @@ pub fn save_texture_to_file(
     let output_floats: &[f32] = bytemuck::cast_slice(&output_data);
 
     // AI-generated snippet to print metrics, TODO delete it
-    //     {
-    //         if !output_floats.is_empty() {
-    //             let mut min = output_floats[0];
-    //             let mut max = output_floats[0];
-    //             let mut sum = 0.0;
-    //
-    //             for &val in output_floats {
-    //                 if val < min {
-    //                     min = val;
-    //                 }
-    //                 if val > max {
-    //                     max = val;
-    //                 }
-    //                 sum += val;
-    //             }
-    //
-    //             let avg = sum / output_floats.len() as f32;
-    //             println!(
-    //                 "Texture Stats -> Min: {:.4}, Max: {:.4}, Avg: {:.4}",
-    //                 min, max, avg
-    //             );
-    //         } else {
-    //             println!("Texture Stats -> Buffer is empty");
-    //         }
-    //     }
+    {
+        if !output_floats.is_empty() {
+            let mut min = output_floats[0];
+            let mut max = output_floats[0];
+            let mut sum = 0.0;
 
-    let mut img = ImageBuffer::new(layout_dimensions.width, layout_dimensions.height);
-    match channels {
-        1 => {
-            for (i, pixel) in img.pixels_mut().enumerate() {
-                let r = (output_floats[i] * 255.0).clamp(0.0, 255.0) as u8;
-                *pixel = Rgb([r, 0, 0]); // G and B padded with 0
+            for &val in output_floats {
+                if val < min {
+                    min = val;
+                }
+                if val > max {
+                    max = val;
+                }
+                sum += val;
             }
+
+            let avg = sum / output_floats.len() as f32;
+            println!(
+                "Texture Stats -> Min: {:.4}, Max: {:.4}, Avg: {:.4}",
+                min, max, avg
+            );
+        } else {
+            println!("Texture Stats -> Buffer is empty");
         }
-        2 => {
-            for (i, pixel) in img.pixels_mut().enumerate() {
-                let r = (output_floats[i * 2] * 255.0).clamp(0.0, 255.0) as u8;
-                let g = (output_floats[i * 2 + 1] * 255.0).clamp(0.0, 255.0) as u8;
-                *pixel = Rgb([r, g, 0]); // B padded with 0
-            }
-        }
-        _ => {
-            for (i, pixel) in img.pixels_mut().enumerate() {
-                let r = (output_floats[i * 3] * 255.0).clamp(0.0, 255.0) as u8;
-                let g = (output_floats[i * 3 + 1] * 255.0).clamp(0.0, 255.0) as u8;
-                let b = (output_floats[i * 3 + 2] * 255.0).clamp(0.0, 255.0) as u8;
-                *pixel = Rgb([r, g, b]);
-            }
-        }
+    }
+
+    let mut img: ImageBuffer<image::Luma<u16>, Vec<u16>> =
+        ImageBuffer::new(layout_dimensions.width, layout_dimensions.height);
+
+    for (x, y, pixel) in img.enumerate_pixels_mut() {
+        let val_f32 = output_floats[(y * layout_dimensions.width + x) as usize];
+        let val_u16 = (val_f32.clamp(0.0, 1.0) * 65535.0) as u16;
+
+        *pixel = image::Luma([val_u16]);
     }
 
     let _ = img
@@ -375,13 +360,6 @@ pub fn generate_chunkable_fbm(
 }
 
 impl TerrainGenContext {
-    /// First render pass does the following:
-    ///
-    /// `new` allocates every GPU object the pass needs: the 5 textures, the
-    /// sampler, the bind group, and the compute pipeline. Textures are
-    /// zero-initialized by wgpu; the caller uploads real heights with
-    /// `queue.write_texture(&heightmap_texture, ...)` before dispatching.
-    /// See [`Self::run_first_pass`].
     pub fn new(gpu: Arc<GpuContext>) -> Self {
         let texture_size = wgpu::Extent3d {
             width: CHUNK_SIZE,
@@ -864,10 +842,12 @@ impl TerrainGenContext {
             sobel_write_bind_group,
             heightmap_bind_groups,
             water_sediment_bind_groups,
-            rain_texture,
-            gradient_texture,
+            //for some textures the rust-side handle is never used
+            //so prefix with underscore to prevent rustc warning
+            _rain_texture: rain_texture,
+            _gradient_texture: gradient_texture,
             heightmap_textures,
-            water_sediment_textures,
+            _water_sediment_textures: water_sediment_textures,
             temp_buffer: None,
             gpu,
             texture_size,
@@ -881,74 +861,11 @@ impl TerrainGenContext {
         )
     }
 
-    pub fn save_everything(&self) {
-        let encoder = self
-            .gpu
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-        save_texture_to_file(&self.rain_texture, "rain.png", encoder, &self.gpu, 1);
-
-        let encoder = self
-            .gpu
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-        save_texture_to_file(
-            &self.heightmap_textures[0],
-            "heightmap_0.png",
-            encoder,
-            &self.gpu,
-            1,
-        );
-
-        let encoder = self
-            .gpu
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-        save_texture_to_file(
-            &self.heightmap_textures[1],
-            "heightmap_1.png",
-            encoder,
-            &self.gpu,
-            1,
-        );
-
-        let encoder = self
-            .gpu
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-        save_texture_to_file(
-            &self.water_sediment_textures[0],
-            "water_0.png",
-            encoder,
-            &self.gpu,
-            2,
-        );
-        let encoder = self
-            .gpu
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-        save_texture_to_file(
-            &self.water_sediment_textures[1],
-            "water_1.png",
-            encoder,
-            &self.gpu,
-            2,
-        );
-
-        let encoder = self
-            .gpu
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-        save_texture_to_file(
-            &&self.gradient_texture,
-            "gradient.png",
-            encoder,
-            &self.gpu,
-            2,
-        );
-    }
-
-    pub fn run_chunk_generation(&mut self, mut encoder: wgpu::CommandEncoder) {
+    // If an encoder is not provided, this will create one
+    // This consumes the command encoder for reading data back to the cpu
+    pub fn run_chunk_generation(&mut self, encoder: Option<wgpu::CommandEncoder>) -> Vec<f32> {
+        let mut encoder =
+            encoder.unwrap_or(self.gpu.device.create_command_encoder(&Default::default()));
         let mut pass = encoder.begin_compute_pass(&Default::default());
         let workgroup_dispatch_counts = self.dispatch_workgroups();
         //bind group 0 rain never changes
@@ -1001,15 +918,14 @@ impl TerrainGenContext {
                 &[],
             );
 
-            if i % 4 == 0 {
+            if i % 4 == 5 {
                 drop(pass);
                 let filename = format!("/tmp/heightmaps/heightmap_{:04}.png", i / 4);
-                save_texture_to_file(
+                save_heightmap(
                     &self.heightmap_textures[heightmap_index],
                     &filename,
                     encoder,
                     &self.gpu,
-                    1,
                 );
                 encoder = self.gpu.device.create_command_encoder(&Default::default());
                 pass = encoder.begin_compute_pass(&Default::default());
@@ -1026,28 +942,62 @@ impl TerrainGenContext {
         //get last written heightmap
         //after the erosion flip, heightmap_index is the texture the last
         //erosion pass wrote to; do not flip again or we read the previous frame
-        let output_buffer_dimensions =
-            get_layout_dimensions(&self.heightmap_textures[heightmap_index]);
+        let layout_dimensions = get_layout_dimensions(&self.heightmap_textures[heightmap_index]);
         //allocate a buffer of the correct size
         if self.temp_buffer.is_none()
-            || self.temp_buffer.as_ref().unwrap().size()
-                < output_buffer_dimensions.buffer_size as u64
+            || self.temp_buffer.as_ref().unwrap().size() < layout_dimensions.buffer_size as u64
         {
             self.temp_buffer = Some(self.gpu.device.create_buffer(&wgpu::wgt::BufferDescriptor {
                 label: None,
-                size: output_buffer_dimensions.buffer_size as u64,
+                size: layout_dimensions.buffer_size as u64,
                 usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             }));
         }
         //finish the compute pass
         drop(pass);
-        save_texture_to_file(
+        //allocate a buffer of the correct size
+        let mut temp_buffer = self.gpu.device.create_buffer(&wgpu::wgt::BufferDescriptor {
+            label: None,
+            size: layout_dimensions.buffer_size as u64,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        //copy the texture to a buffer so its readable to cpu
+        read_to_buffer(
             &self.heightmap_textures[heightmap_index],
-            "final_heightmap.png",
-            encoder,
-            &self.gpu,
-            1,
+            &mut temp_buffer,
+            &layout_dimensions,
+            &mut encoder,
         );
+        let mut output_data = Vec::with_capacity(
+            (layout_dimensions.width * layout_dimensions.height * layout_dimensions.bytes_per_pixel)
+                as usize,
+        );
+        let submission_index = self.gpu.queue.submit(Some(encoder.finish()));
+        read_to_cpu(
+            &mut temp_buffer,
+            &mut output_data,
+            &self.gpu.device,
+            submission_index,
+            &layout_dimensions,
+        );
+
+        let output_floats: Vec<f32> = bytemuck::cast_slice(&output_data).into();
+
+        let mut img: ImageBuffer<image::Luma<u16>, Vec<u16>> =
+            ImageBuffer::new(layout_dimensions.width, layout_dimensions.height);
+
+        for (x, y, pixel) in img.enumerate_pixels_mut() {
+            let val_f32 = output_floats[(y * layout_dimensions.width + x) as usize];
+            let val_u16 = (val_f32.clamp(0.0, 1.0) * 65535.0) as u16;
+
+            *pixel = image::Luma([val_u16]);
+        }
+
+        img.save("final_heightmap.png")
+            .expect("Failed to save heightmap");
+
+        return output_floats;
     }
 }

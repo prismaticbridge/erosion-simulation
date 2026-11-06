@@ -1,10 +1,12 @@
 // mod bridge_data;
-mod terrain;
-mod test_terrain;
+mod application;
+mod bridge;
+mod bridge_data;
+mod chunk;
+mod terraingen;
+use crate::bridge::App;
 use winit::error::EventLoopError;
 use winit::event_loop::EventLoop;
-
-use crate::test_terrain::App;
 
 fn main() -> Result<(), EventLoopError> {
     let event_loop = EventLoop::with_user_event().build()?;
