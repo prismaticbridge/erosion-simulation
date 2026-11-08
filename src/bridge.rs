@@ -1,11 +1,13 @@
 use std::{
+    path::PathBuf,
+    str::FromStr,
     sync::{Arc, Mutex},
     thread::{JoinHandle, sleep},
     time::{Duration, Instant},
 };
 
 use glam::Vec2;
-use honeycomb_3d::Renderer;
+use honeycomb_3d::{Renderer, ShaderConfig};
 use winit::{
     application::ApplicationHandler,
     event::{DeviceEvent, KeyEvent, WindowEvent},
@@ -110,13 +112,47 @@ impl App {
     }
 }
 
+pub fn get_additional_bind_groups() -> ShaderConfig<'static> {
+    static LIGHT_DIRECTION_BIND_GROUP_LAYOUTS: &[wgpu::BindGroupLayoutDescriptor] =
+        &[wgpu::BindGroupLayoutDescriptor {
+            label: Some("light direction"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        }];
+
+    return ShaderConfig {
+        shader_path: PathBuf::from_str("shaders/render_terrain.wgsl").unwrap(),
+        additional_bind_group_layouts: LIGHT_DIRECTION_BIND_GROUP_LAYOUTS,
+    };
+}
+
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.state.is_none() {
-            let result = pollster::block_on(Renderer::new(event_loop, &REQUESTED_FEATURES));
+            let additional_bind_groups = get_additional_bind_groups();
+            let result = pollster::block_on(Renderer::new(
+                event_loop,
+                &REQUESTED_FEATURES,
+                Some(&additional_bind_groups),
+                None,
+            ));
             let mut renderer = match result {
                 Ok(renderer) => renderer,
-                Err(features) => pollster::block_on(Renderer::new(event_loop, &features)).expect(
+                Err(features) => pollster::block_on(Renderer::new(
+                    event_loop,
+                    &features,
+                    Some(&additional_bind_groups),
+                    None,
+                ))
+                .expect(
                     "Failed to create renderer with features that are supposed to be supported",
                 ),
             };

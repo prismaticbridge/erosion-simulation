@@ -1,11 +1,11 @@
-use std::sync::Arc;
+use std::{num::NonZero, sync::Arc};
 
 use glam::{Quat, Vec3};
-use honeycomb_3d::GpuContext;
+use honeycomb_3d::{GpuContext, buffer::GpuBuffer};
 use winit::{event::ElementState, keyboard::KeyCode};
 
 use crate::{
-    bridge::UPDATE_HZ,
+    bridge::{UPDATE_HZ, get_additional_bind_groups},
     bridge_data::{Event, SceneState, SharedInputOutput},
     chunk::{Chunk, WORLD_HEIGHT},
     terraingen::TerrainGenContext,
@@ -18,6 +18,8 @@ const MOUSE_MOVE_THRESHOLD: f64 = 1e-8;
 
 const MOVEMENT_SPEED: f32 = 10.0;
 const MOVEMENT_PER_TICK: f32 = MOVEMENT_SPEED / UPDATE_HZ as f32;
+const LIGHT_DIRECTION: Vec3 = Vec3::new(-0.57735027, -0.57735027, -0.57735027);
+// const LIGHT_DIRECTION: Vec3 = Vec3::new(1000.0, 0.0, 0.0);
 
 pub struct Game {
     shared_io: Arc<SharedInputOutput>,
@@ -41,8 +43,26 @@ impl Game {
         let mut terrain_generator = TerrainGenContext::new(Arc::clone(&gpu_context));
         let chunk_heightmap = terrain_generator.run_chunk_generation(None);
         let terrain_chunk = Chunk::new(chunk_heightmap, 0, 0);
-        let (vertices, indices) = terrain_chunk.to_3d_geometry();
-        renderer.add_static_object(main_scene, &vertices, &indices);
+        let (geometry, indices) = terrain_chunk.to_3d_geometry();
+
+        let mut light_direction_buffer = GpuBuffer::new(
+            Arc::clone(&gpu_context),
+            wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::UNIFORM,
+        );
+        light_direction_buffer.append(bytemuck::cast_slice(&LIGHT_DIRECTION.to_array()));
+
+        let entries = &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                buffer: &light_direction_buffer.buffer,
+                offset: 0,
+                size: NonZero::new(std::mem::size_of::<Vec3>() as u64),
+            }),
+        }];
+
+        renderer.add_static_bind_group(entries, 0);
+
+        renderer.add_static_object(main_scene, &geometry, &indices);
         if let Ok(mut rs) = shared_io.render_state.lock() {
             rs.scenes.push(SceneState::new());
         }

@@ -9,14 +9,14 @@ use image::ImageBuffer;
 use noise::{NoiseFn, Perlin};
 use wgpu::{ShaderModuleDescriptor, SubmissionIndex};
 
-pub const CHUNK_SIZE: u32 = 128; // texture width/height in texels for one terrain chunk
+pub const CHUNK_SIZE: u32 = 1024; // texture width/height in texels for one terrain chunk
 pub const PAD_SIZE: u32 = CHUNK_SIZE / 2;
 const WORKGROUP_SIZE: u32 = 16;
 const TERRAIN_GEN_ITERATIONS: u32 = 1024;
 
 // Fractional brownian motion parameters for initial heightmap generation
 const FBM_RESOLUTION: u32 = 4;
-const FBM_OCTAVES: u32 = 6;
+const FBM_OCTAVES: u32 = 5;
 const FBM_PERSISTENCE: f64 = 0.45;
 
 const SHADER_DIRECTORY: LazyLock<PathBuf> = LazyLock::new(|| {

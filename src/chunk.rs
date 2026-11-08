@@ -3,11 +3,11 @@ use std::hash::{Hash, Hasher};
 use glam::Vec3;
 use honeycomb_3d::vertex::Vertex;
 
-use crate::terraingen::{CHUNK_SIZE, LayoutDimensions, get_layout_dimensions};
+use crate::terraingen::CHUNK_SIZE;
 
 //size of each "block" or heightmap pixel
 pub const MAP_SCALE: f32 = 0.25;
-pub const WORLD_HEIGHT: f32 = 8.0;
+pub const WORLD_HEIGHT: f32 = 32.0;
 
 pub struct Chunk {
     pub x: i32,
@@ -84,6 +84,7 @@ impl Chunk {
     pub fn new(heightmap: Vec<f32>, x: i32, y: i32) -> Self {
         Self { x, y, heightmap }
     }
+    //returns (vertices, indices, normals)
     pub fn to_3d_geometry(&self) -> (Vec<Vertex>, Vec<u32>) {
         let mut geometry = Vec::<Vertex>::with_capacity((CHUNK_SIZE * CHUNK_SIZE) as usize);
         let mut indices =
@@ -102,23 +103,50 @@ impl Chunk {
                         ((y - chk_sz_i32 / 2) as f32) * MAP_SCALE,
                     ],
                     color: map_to_color(self.heightmap[(y * chk_sz_i32 + x) as usize]),
+                    normal: [0.0, 0.0, 0.0], // set these later
                 });
             }
         }
         //build triangles
         for y in 0..CHUNK_SIZE - 1 {
             for x in 0..CHUNK_SIZE - 1 {
+                let topleft = y * CHUNK_SIZE + x;
+                let topright = y * CHUNK_SIZE + x + 1;
+                let bottomleft = (y + 1) * CHUNK_SIZE + x;
+                let bottomright = (y + 1) * CHUNK_SIZE + x + 1;
                 indices.extend([
-                    // first triangle: A, C, B
-                    y * CHUNK_SIZE + x,
-                    (y + 1) * CHUNK_SIZE + x,
-                    y * CHUNK_SIZE + (x + 1),
-                    // second triangle: B, C, D
-                    y * CHUNK_SIZE + (x + 1),
-                    (y + 1) * CHUNK_SIZE + x,
-                    (y + 1) * CHUNK_SIZE + (x + 1),
+                    topleft,
+                    bottomleft,
+                    topright,
+                    bottomright,
+                    topright,
+                    bottomleft,
                 ]);
+                let topleft_v = Vec3::from_array(geometry[topleft as usize].position);
+                let topright_v = Vec3::from_array(geometry[topright as usize].position);
+                let bottomleft_v = Vec3::from_array(geometry[bottomleft as usize].position);
+                let bottomright_v = Vec3::from_array(geometry[bottomright as usize].position);
+
+                let normal = (bottomleft_v - topleft_v).cross(topright_v - topleft_v);
+                for i in 0..3 {
+                    geometry[topleft as usize].normal[i] += normal[i];
+                    geometry[bottomleft as usize].normal[i] += normal[i];
+                    geometry[topright as usize].normal[i] += normal[i];
+                }
+                let normal = (topright_v - bottomright_v).cross(bottomleft_v - bottomright_v);
+                for i in 0..3 {
+                    geometry[bottomright as usize].normal[i] += normal[i];
+                    geometry[topright as usize].normal[i] += normal[i];
+                    geometry[bottomleft as usize].normal[i] += normal[i];
+                }
             }
+        }
+
+        for vertex in &mut geometry {
+            let magnitude = Vec3::from_array(vertex.normal).length();
+            vertex.normal[0] /= magnitude;
+            vertex.normal[1] /= magnitude;
+            vertex.normal[2] /= magnitude;
         }
 
         // print as output for a .obj file
