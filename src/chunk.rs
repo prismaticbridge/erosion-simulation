@@ -3,8 +3,6 @@ use std::hash::{Hash, Hasher};
 use glam::Vec3;
 use honeycomb_3d::vertex::Vertex;
 
-use crate::terraingen::CHUNK_SIZE;
-
 //size of each "block" or heightmap pixel
 pub const MAP_SCALE: f32 = 0.25;
 pub const WORLD_HEIGHT: f32 = 32.0;
@@ -85,17 +83,17 @@ impl Chunk {
         Self { x, y, heightmap }
     }
     //returns (vertices, indices, normals)
-    pub fn to_3d_geometry(&self) -> (Vec<Vertex>, Vec<u32>) {
-        let mut geometry = Vec::<Vertex>::with_capacity((CHUNK_SIZE * CHUNK_SIZE) as usize);
+    pub fn to_3d_geometry(&self, chunk_size: u32) -> (Vec<Vertex>, Vec<u32>) {
+        let mut geometry = Vec::<Vertex>::with_capacity((chunk_size * chunk_size) as usize);
         let mut indices =
-            Vec::<u32>::with_capacity(((CHUNK_SIZE - 1) * (CHUNK_SIZE - 1) * 6) as usize);
+            Vec::<u32>::with_capacity(((chunk_size - 1) * (chunk_size - 1) * 6) as usize);
 
         //build geometry
         //this is confusing! x and y are texture indices
         //but the camera projection uses x and z as horizontal axes
-        let chk_sz_i32: i32 = CHUNK_SIZE as i32;
-        for y in 0..CHUNK_SIZE as i32 {
-            for x in 0..CHUNK_SIZE as i32 {
+        let chk_sz_i32: i32 = chunk_size as i32;
+        for y in 0..chk_sz_i32 as i32 {
+            for x in 0..chk_sz_i32 as i32 {
                 geometry.push(Vertex {
                     position: [
                         ((x - chk_sz_i32 / 2) as f32) * MAP_SCALE,
@@ -108,12 +106,12 @@ impl Chunk {
             }
         }
         //build triangles
-        for y in 0..CHUNK_SIZE - 1 {
-            for x in 0..CHUNK_SIZE - 1 {
-                let topleft = y * CHUNK_SIZE + x;
-                let topright = y * CHUNK_SIZE + x + 1;
-                let bottomleft = (y + 1) * CHUNK_SIZE + x;
-                let bottomright = (y + 1) * CHUNK_SIZE + x + 1;
+        for y in 0..chunk_size - 1 {
+            for x in 0..chunk_size - 1 {
+                let topleft = y * chunk_size + x;
+                let topright = y * chunk_size + x + 1;
+                let bottomleft = (y + 1) * chunk_size + x;
+                let bottomright = (y + 1) * chunk_size + x + 1;
                 indices.extend([
                     topleft,
                     bottomleft,

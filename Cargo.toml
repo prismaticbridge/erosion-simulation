@@ -9,7 +9,9 @@ glam = { version = "0.34", features = ["bytemuck"] }
 honeycomb-3d = { path = "./honeycomb-3d" }
 image = "0.25"
 noise = "0.9"
+noyalib = "0.0.58"
 pollster = "1.0"
 rand = "0.10"
+serde = { version = "1.0.229", features = ["derive"] }
 wgpu = "30.0"
 winit = { version = "0.30", features = ["wayland"] }

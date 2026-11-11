@@ -7,17 +7,19 @@ use bytemuck::NoUninit;
 use honeycomb_3d::GpuContext;
 use image::ImageBuffer;
 use noise::{NoiseFn, Perlin};
+use serde::Deserialize;
 use wgpu::{ShaderModuleDescriptor, SubmissionIndex};
 
-pub const CHUNK_SIZE: u32 = 1024; // texture width/height in texels for one terrain chunk
-pub const PAD_SIZE: u32 = CHUNK_SIZE / 2;
 const WORKGROUP_SIZE: u32 = 16;
-const TERRAIN_GEN_ITERATIONS: u32 = 1024;
 
-// Fractional brownian motion parameters for initial heightmap generation
-const FBM_RESOLUTION: u32 = 4;
-const FBM_OCTAVES: u32 = 5;
-const FBM_PERSISTENCE: f64 = 0.45;
+#[derive(Deserialize)]
+pub struct Config {
+    pub chunk_size: u32,
+    pub iterations: u32,
+    pub fbm_resolution: u32,
+    pub fbm_octaves: u32,
+    pub fbm_persistence: f64,
+}
 
 const SHADER_DIRECTORY: LazyLock<PathBuf> = LazyLock::new(|| {
     if let Some(manifest_dir) = option_env!("CARGO_MANIFEST_DIR") {
@@ -35,6 +37,7 @@ pub struct TerrainGenContext {
     accumulate_pipeline: wgpu::ComputePipeline,
     erosion_pipeline: wgpu::ComputePipeline,
     advect_pipeline: wgpu::ComputePipeline,
+    // thermal_pipeline: wgpu::ComputePipeline,
     rain_bind_group: wgpu::BindGroup,
     sobel_read_bind_group: wgpu::BindGroup,
     sobel_write_bind_group: wgpu::BindGroup,
@@ -45,13 +48,15 @@ pub struct TerrainGenContext {
     _rain_texture: wgpu::Texture,
     _gradient_texture: wgpu::Texture,
     heightmap_textures: [wgpu::Texture; 2], // gets read at the end
-    _water_sediment_textures: [wgpu::Texture; 2],
+    water_sediment_textures: [wgpu::Texture; 2],
 
     temp_buffer: Option<wgpu::Buffer>,
     gpu: Arc<GpuContext>,
 
     // water_sediment_index: u8,
     texture_size: wgpu::Extent3d,
+
+    pub config: Config,
 }
 
 fn create_2d_texture(
@@ -79,6 +84,7 @@ pub struct LayoutDimensions {
     buffer_size: u32,
     width: u32,
     height: u32,
+    channels: u32,
 }
 
 pub fn get_layout_dimensions(texture: &wgpu::Texture) -> LayoutDimensions {
@@ -91,12 +97,15 @@ pub fn get_layout_dimensions(texture: &wgpu::Texture) -> LayoutDimensions {
     let padded_bytes_per_row = (unpadded_bytes_per_row + align - 1) & !(align - 1);
     let buffer_size = texture.height() * padded_bytes_per_row;
 
+    let channels = texture.format().components() as u32;
+
     LayoutDimensions {
-        bytes_per_pixel,
+        bytes_per_pixel: bytes_per_pixel,
         padded_bytes_per_row,
         buffer_size,
         width: texture.width(),
         height: texture.height(),
+        channels,
     }
 }
 
@@ -169,14 +178,14 @@ pub fn save_heightmap(
     gpu: &GpuContext,
 ) {
     let layout_dimensions = get_layout_dimensions(&texture);
-    //allocate a buffer of the correct size
+    // allocate a buffer of the correct size
     let mut temp_buffer = gpu.device.create_buffer(&wgpu::wgt::BufferDescriptor {
         label: None,
         size: layout_dimensions.buffer_size as u64,
         usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
-    //finish the compute pass
+    // finish the compute pass
     read_to_buffer(&texture, &mut temp_buffer, &layout_dimensions, &mut encoder);
     let mut output_data = Vec::with_capacity(
         (layout_dimensions.width * layout_dimensions.height * layout_dimensions.bytes_per_pixel)
@@ -194,45 +203,79 @@ pub fn save_heightmap(
     let output_floats: &[f32] = bytemuck::cast_slice(&output_data);
 
     // AI-generated snippet to print metrics, TODO delete it
-    {
-        if !output_floats.is_empty() {
-            let mut min = output_floats[0];
-            let mut max = output_floats[0];
-            let mut sum = 0.0;
+    let mut max = 0.0;
+    if !output_floats.is_empty() {
+        let mut min = output_floats[0];
+        let mut sum = 0.0;
 
-            for &val in output_floats {
-                if val < min {
-                    min = val;
-                }
-                if val > max {
-                    max = val;
-                }
-                sum += val;
+        for &val in output_floats {
+            if val < min {
+                min = val;
+            }
+            if val > max {
+                max = val;
+            }
+            sum += val;
+        }
+
+        let avg = sum / output_floats.len() as f32;
+        println!(
+            "Texture Stats -> Min: {:.4}, Max: {:.4}, Avg: {:.4}",
+            min, max, avg
+        );
+    } else {
+        println!("Texture Stats -> Buffer is empty");
+    }
+
+    let channels = layout_dimensions.channels;
+
+    match channels {
+        1 => {
+            let mut img: ImageBuffer<image::Luma<u16>, Vec<u16>> =
+                ImageBuffer::new(layout_dimensions.width, layout_dimensions.height);
+
+            for (x, y, pixel) in img.enumerate_pixels_mut() {
+                let idx = (y * layout_dimensions.width + x) as usize;
+                let val_f32 = output_floats[idx];
+                let val_u16 = (val_f32.clamp(0.0, 1.0) * 65535.0) as u16;
+
+                *pixel = image::Luma([val_u16]);
             }
 
-            let avg = sum / output_floats.len() as f32;
-            println!(
-                "Texture Stats -> Min: {:.4}, Max: {:.4}, Avg: {:.4}",
-                min, max, avg
-            );
-        } else {
-            println!("Texture Stats -> Buffer is empty");
+            let _ = img
+                .save(file)
+                .inspect_err(|e| eprintln!("Failed to save image to file: {e}"));
+        }
+        2 | 3 => {
+            let mut img: ImageBuffer<image::Rgb<u16>, Vec<u16>> =
+                ImageBuffer::new(layout_dimensions.width, layout_dimensions.height);
+
+            for (x, y, pixel) in img.enumerate_pixels_mut() {
+                let base_idx = ((y * layout_dimensions.width + x) * channels as u32) as usize;
+
+                let r_f32 = output_floats[base_idx];
+                let g_f32 = output_floats[base_idx + 1];
+                let b_f32 = if channels == 3 {
+                    output_floats[base_idx + 2]
+                } else {
+                    0.0 // Pad blue channel to 0 for 2-channel textures
+                };
+
+                let r = (r_f32.clamp(0.0, 1.0) * 65535.0) as u16;
+                let g = (g_f32.clamp(0.0, 1.0) * 65535.0) as u16;
+                let b = (b_f32.clamp(0.0, 1.0) * 65535.0) as u16;
+
+                *pixel = image::Rgb([r, g, b]);
+            }
+
+            let _ = img
+                .save(file)
+                .inspect_err(|e| eprintln!("Failed to save image to file: {e}"));
+        }
+        other => {
+            eprintln!("Unsupported channel count ({other}) in save_heightmap");
         }
     }
-
-    let mut img: ImageBuffer<image::Luma<u16>, Vec<u16>> =
-        ImageBuffer::new(layout_dimensions.width, layout_dimensions.height);
-
-    for (x, y, pixel) in img.enumerate_pixels_mut() {
-        let val_f32 = output_floats[(y * layout_dimensions.width + x) as usize];
-        let val_u16 = (val_f32.clamp(0.0, 1.0) * 65535.0) as u16;
-
-        *pixel = image::Luma([val_u16]);
-    }
-
-    let _ = img
-        .save(file)
-        .inspect_err(|e| eprintln!("Failed to save image to file: {e}"));
 }
 
 /// Uploads the raw bytes of a slice to a gpu texture
@@ -361,9 +404,13 @@ pub fn generate_chunkable_fbm(
 
 impl TerrainGenContext {
     pub fn new(gpu: Arc<GpuContext>) -> Self {
+        let config_str =
+            std::fs::read_to_string("params.yaml").expect("Failed to read params file");
+        let config: Config = noyalib::from_str(&config_str).expect("Failed to parse params file");
+
         let texture_size = wgpu::Extent3d {
-            width: CHUNK_SIZE,
-            height: CHUNK_SIZE,
+            width: config.chunk_size,
+            height: config.chunk_size,
             depth_or_array_layers: 1,
         };
 
@@ -597,6 +644,40 @@ impl TerrainGenContext {
                     cache: Default::default(),
                 });
 
+        //         let thermal_pipeline_layout =
+        //             gpu.device
+        //                 .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        //                     label: Some("thermal erosion pipeline"),
+        //                     bind_group_layouts: &[None, None, Some(&heightmap_bind_group_layout)],
+        //                     immediate_size: 0,
+        //                 });
+        //
+        //         let thermal_erosion_shader_path = SHADER_DIRECTORY.join("thermal.wgsl");
+        //         let thermal_erosion_shader_source = std::fs::read_to_string(&thermal_erosion_shader_path)
+        //             .expect(&format!(
+        //                 "Failed to read {}",
+        //                 thermal_erosion_shader_path.display()
+        //             ));
+        //         let thermal_erosion_shader =
+        //             gpu.device
+        //                 .create_shader_module(wgpu::ShaderModuleDescriptor {
+        //                     label: Some("thermal erosion shader"),
+        //                     source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Owned(
+        //                         thermal_erosion_shader_source,
+        //                     )),
+        //                 });
+        //
+        //         let thermal_pipeline =
+        //             gpu.device
+        //                 .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        //                     label: Some("thermal erosion pipeline"),
+        //                     layout: Some(&thermal_pipeline_layout),
+        //                     module: &thermal_erosion_shader,
+        //                     entry_point: None,
+        //                     compilation_options: Default::default(),
+        //                     cache: Default::default(),
+        //                 });
+
         let mut rain_texture = create_2d_texture(
             &gpu.device,
             "rain noise",
@@ -644,10 +725,10 @@ impl TerrainGenContext {
         ];
         {
             let mut initial_heightmap = generate_chunkable_fbm(
-                (CHUNK_SIZE, CHUNK_SIZE),
-                (FBM_RESOLUTION, FBM_RESOLUTION),
-                FBM_OCTAVES,
-                FBM_PERSISTENCE,
+                (config.chunk_size, config.chunk_size),
+                (config.fbm_resolution, config.fbm_resolution),
+                config.fbm_octaves,
+                config.fbm_persistence,
             );
             // erosion.py normalizes the terrain to 0..1 before simulating, and
             // the erosion constants assume that range.
@@ -676,13 +757,14 @@ impl TerrainGenContext {
             image::save_buffer(
                 "initial_heightmap.png",
                 &heightmap_u8,
-                CHUNK_SIZE,
-                CHUNK_SIZE,
+                config.chunk_size,
+                config.chunk_size,
                 image::ExtendedColorType::L8,
             )
             .expect("Failed to save initial heightmap");
         }
 
+        // TODO delete COPY_SRC from both of these
         let mut water_sediment_textures = [
             create_2d_texture(
                 &gpu.device,
@@ -691,7 +773,8 @@ impl TerrainGenContext {
                 wgpu::TextureFormat::Rg32Float,
                 wgpu::TextureUsages::TEXTURE_BINDING
                     | wgpu::TextureUsages::COPY_DST
-                    | wgpu::TextureUsages::STORAGE_BINDING,
+                    | wgpu::TextureUsages::STORAGE_BINDING
+                    | wgpu::TextureUsages::COPY_SRC,
             ),
             create_2d_texture(
                 &gpu.device,
@@ -700,7 +783,8 @@ impl TerrainGenContext {
                 wgpu::TextureFormat::Rg32Float,
                 wgpu::TextureUsages::TEXTURE_BINDING
                     | wgpu::TextureUsages::COPY_DST
-                    | wgpu::TextureUsages::STORAGE_BINDING,
+                    | wgpu::TextureUsages::STORAGE_BINDING
+                    | wgpu::TextureUsages::COPY_SRC,
             ),
         ];
 
@@ -837,6 +921,7 @@ impl TerrainGenContext {
             accumulate_pipeline,
             erosion_pipeline,
             advect_pipeline,
+            // thermal_pipeline,
             rain_bind_group,
             sobel_read_bind_group,
             sobel_write_bind_group,
@@ -847,10 +932,11 @@ impl TerrainGenContext {
             _rain_texture: rain_texture,
             _gradient_texture: gradient_texture,
             heightmap_textures,
-            _water_sediment_textures: water_sediment_textures,
+            water_sediment_textures,
             temp_buffer: None,
             gpu,
             texture_size,
+            config,
         }
     }
 
@@ -882,7 +968,7 @@ impl TerrainGenContext {
             Some(&self.water_sediment_bind_groups[water_sediment_index]),
             &[],
         );
-        for i in 0..TERRAIN_GEN_ITERATIONS {
+        for i in 0..self.config.iterations {
             //accumulate flips water/sediment textures
             pass.set_pipeline(&self.accumulate_pipeline);
             pass.dispatch_workgroups(workgroup_dispatch_counts.0, workgroup_dispatch_counts.1, 1);
@@ -918,13 +1004,26 @@ impl TerrainGenContext {
                 &[],
             );
 
-            if i % 4 == 5 {
+            //thermal erosion
+            // pass.set_pipeline(&self.thermal_pipeline);
+            // pass.dispatch_workgroups(workgroup_dispatch_counts.0, workgroup_dispatch_counts.1, 1);
+            // heightmap_index = 1 - heightmap_index;
+            // pass.set_bind_group(2, Some(&self.heightmap_bind_groups[heightmap_index]), &[]);
+
+            if i % 16 == 0 || i >= 1000 {
                 drop(pass);
-                let filename = format!("/tmp/heightmaps/heightmap_{:04}.png", i / 4);
+                let filename = format!("/tmp/heightmaps/heightmap_{:04}.png", i);
                 save_heightmap(
                     &self.heightmap_textures[heightmap_index],
                     &filename,
                     encoder,
+                    &self.gpu,
+                );
+                let filename = format!("/tmp/heightmaps/water_{:04}.png", i);
+                save_heightmap(
+                    &self.water_sediment_textures[water_sediment_index],
+                    &filename,
+                    self.gpu.device.create_command_encoder(&Default::default()),
                     &self.gpu,
                 );
                 encoder = self.gpu.device.create_command_encoder(&Default::default());
@@ -985,18 +1084,18 @@ impl TerrainGenContext {
 
         let output_floats: Vec<f32> = bytemuck::cast_slice(&output_data).into();
 
-        let mut img: ImageBuffer<image::Luma<u16>, Vec<u16>> =
-            ImageBuffer::new(layout_dimensions.width, layout_dimensions.height);
-
-        for (x, y, pixel) in img.enumerate_pixels_mut() {
-            let val_f32 = output_floats[(y * layout_dimensions.width + x) as usize];
-            let val_u16 = (val_f32.clamp(0.0, 1.0) * 65535.0) as u16;
-
-            *pixel = image::Luma([val_u16]);
-        }
-
-        img.save("final_heightmap.png")
-            .expect("Failed to save heightmap");
+        //         let mut img: ImageBuffer<image::Luma<u16>, Vec<u16>> =
+        //             ImageBuffer::new(layout_dimensions.width, layout_dimensions.height);
+        //
+        //         for (x, y, pixel) in img.enumerate_pixels_mut() {
+        //             let val_f32 = output_floats[(y * layout_dimensions.width + x) as usize];
+        //             let val_u16 = (val_f32.clamp(0.0, 1.0) * 65535.0) as u16;
+        //
+        //             *pixel = image::Luma([val_u16]);
+        //         }
+        //
+        //         img.save("final_heightmap.png")
+        //             .expect("Failed to save heightmap");
 
         return output_floats;
     }

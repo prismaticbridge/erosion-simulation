@@ -1,4 +1,4 @@
-use std::{num::NonZero, sync::Arc};
+use std::{num::NonZero, process::exit, sync::Arc};
 
 use glam::{Quat, Vec3};
 use honeycomb_3d::{GpuContext, buffer::GpuBuffer};
@@ -42,8 +42,9 @@ impl Game {
         let gpu_context = renderer.get_gpu_context();
         let mut terrain_generator = TerrainGenContext::new(Arc::clone(&gpu_context));
         let chunk_heightmap = terrain_generator.run_chunk_generation(None);
+        // exit(0);
         let terrain_chunk = Chunk::new(chunk_heightmap, 0, 0);
-        let (geometry, indices) = terrain_chunk.to_3d_geometry();
+        let (geometry, indices) = terrain_chunk.to_3d_geometry(terrain_generator.config.chunk_size);
 
         let mut light_direction_buffer = GpuBuffer::new(
             Arc::clone(&gpu_context),
@@ -72,7 +73,7 @@ impl Game {
             keyboard_input: [false; NUM_KEYCODES],
             camera_position: Vec3 {
                 x: 0.0,
-                y: WORLD_HEIGHT,
+                y: WORLD_HEIGHT * 2.0,
                 z: -2.0,
             },
             camera_orientation: Quat::IDENTITY,

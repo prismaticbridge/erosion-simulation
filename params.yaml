@@ -1,0 +1,5 @@
+chunk_size: 1024
+iterations: 1024
+fbm_resolution: 4
+fbm_octaves: 6
+fbm_persistence: 0.45
