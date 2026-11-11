@@ -19,6 +19,7 @@ pub struct Config {
     pub fbm_resolution: u32,
     pub fbm_octaves: u32,
     pub fbm_persistence: f64,
+    pub save_intermediate_images: bool,
 }
 
 const SHADER_DIRECTORY: LazyLock<PathBuf> = LazyLock::new(|| {
@@ -1010,7 +1011,7 @@ impl TerrainGenContext {
             // heightmap_index = 1 - heightmap_index;
             // pass.set_bind_group(2, Some(&self.heightmap_bind_groups[heightmap_index]), &[]);
 
-            if i % 16 == 0 || i >= 1000 {
+            if self.config.save_intermediate_images && (i % 16 == 0 || i >= 1000) {
                 drop(pass);
                 let filename = format!("/tmp/heightmaps/heightmap_{:04}.png", i);
                 save_heightmap(

@@ -11,7 +11,7 @@ struct VertexOutput {
 @group(0) @binding(0) var<uniform> camera: mat4x4<f32>;
 @group(1) @binding(0) var<uniform> light_direction: vec3<f32>;
 
-const DIFFUSE: f32 = 0.2;
+const DIFFUSE: f32 = 0.1;
 
 @vertex
 fn vs_main(vertex: VertexInput) -> VertexOutput {

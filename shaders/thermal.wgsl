@@ -1,3 +1,4 @@
+// This shader is currently unused
 @group(2) @binding(0) var heightmap: texture_2d<f32>;
 @group(2) @binding(1) var heightmap_sampler: sampler;
 @group(2) @binding(2) var write_heightmap: texture_storage_2d<r32float, write>;

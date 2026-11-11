@@ -10,6 +10,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     let coords = vec2i(id.xy);
     var water_sediment_sample = textureLoad(water_sediment, coords, 0);
     let rain_amt = textureLoad(rain, coords).r;
+    // let rain_amt = 0.5;
 
     water_sediment_sample.r += rain_amt * RAIN_RATE;
     textureStore(write_water_sediment, coords, water_sediment_sample);

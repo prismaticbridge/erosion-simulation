@@ -1,11 +1,11 @@
-use std::{num::NonZero, process::exit, sync::Arc};
+use std::{num::NonZero, sync::Arc};
 
 use glam::{Quat, Vec3};
-use honeycomb_3d::{GpuContext, buffer::GpuBuffer};
+use honeycomb_3d::{buffer::GpuBuffer, GpuContext};
 use winit::{event::ElementState, keyboard::KeyCode};
 
 use crate::{
-    bridge::{UPDATE_HZ, get_additional_bind_groups},
+    bridge::UPDATE_HZ,
     bridge_data::{Event, SceneState, SharedInputOutput},
     chunk::{Chunk, WORLD_HEIGHT},
     terraingen::TerrainGenContext,
@@ -42,7 +42,6 @@ impl Game {
         let gpu_context = renderer.get_gpu_context();
         let mut terrain_generator = TerrainGenContext::new(Arc::clone(&gpu_context));
         let chunk_heightmap = terrain_generator.run_chunk_generation(None);
-        // exit(0);
         let terrain_chunk = Chunk::new(chunk_heightmap, 0, 0);
         let (geometry, indices) = terrain_chunk.to_3d_geometry(terrain_generator.config.chunk_size);
 

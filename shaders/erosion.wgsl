@@ -14,16 +14,12 @@
 const MIN_HEIGHT_DELTA: f32 = 0.06;
 const SEDIMENT_CAPACITY: f32 = 750.0;
 const DISSOLVE_RATE: f32 = 0.2; // 0.25
-const DEPOSITION_RATE: f32 = 0.001; // 0.001
-const REPOSE_SLOPE: f32 = 0.2;
-
-const WATER_HEIGHT_FACTOR: f32 = 0.0000;//0.0015;
+const DEPOSITION_RATE: f32 = 0.05; // 0.001
+const WATER_HEIGHT_FACTOR: f32 = 0.0;//0.0015;
+const SPIKE_LIMIT: f32 = 0.001;
 
 //convolution kernels
 const SOBEL_KERNEL = vec3f(1.0, 2.0, 1.0);
-
-const LAPLACIAN_TOP = vec3f(-1, -2, -1);
-const LAPLACIAN_CENTER = vec3f(-2, 12, -2);
 
 @compute @workgroup_size(16, 16)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
@@ -33,24 +29,40 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     // }
     let coords = vec2i(id.xy);
 
-    // Clamp the +-1 sobel taps so edge texels don't read out of bounds.
-    // let c = clamp(coords, vec2i(1), vec2i(dims) - vec2i(2));
-    // this is also used later, sample once and save
     let water_sediment_here = textureLoad(water_sediment, coords, 0).rg;
+
+    // Use this version to add water height
+    // let heights_bottom = vec3f(
+    //     textureLoad(heightmap, coords + vec2i(-1, -1), 0).r + textureLoad(water_sediment, coords + vec2i(-1, -1), 0).r * WATER_HEIGHT_FACTOR,
+    //     textureLoad(heightmap, coords + vec2i(0, -1), 0).r + textureLoad(water_sediment, coords + vec2i(0, -1), 0).r * WATER_HEIGHT_FACTOR,
+    //     textureLoad(heightmap, coords + vec2i(1, -1), 0).r + textureLoad(water_sediment, coords + vec2i(1, -1), 0).r * WATER_HEIGHT_FACTOR,
+    // );
+    // let heights_center = vec3f(
+    //     textureLoad(heightmap, coords + vec2i(-1, 0), 0).r + textureLoad(water_sediment, coords + vec2i(-1, 0), 0).r * WATER_HEIGHT_FACTOR,
+    //     textureLoad(heightmap, coords + vec2i(0, 0), 0).r + water_sediment_here.r * WATER_HEIGHT_FACTOR,
+    //     textureLoad(heightmap, coords + vec2i(1, 0), 0).r + textureLoad(water_sediment, coords + vec2i(1, 0), 0).r * WATER_HEIGHT_FACTOR,
+    // );
+    // let heights_top = vec3f(
+    //     textureLoad(heightmap, coords + vec2i(-1, 1), 0).r + textureLoad(water_sediment, coords + vec2i(-1, 1), 0).r * WATER_HEIGHT_FACTOR,
+    //     textureLoad(heightmap, coords + vec2i(0, 1), 0).r + textureLoad(water_sediment, coords + vec2i(0, 1), 0).r * WATER_HEIGHT_FACTOR,
+    //     textureLoad(heightmap, coords + vec2i(1, 1), 0).r + textureLoad(water_sediment, coords + vec2i(1, 1), 0).r * WATER_HEIGHT_FACTOR,
+    // );
+
+    // Use this version for no adding water height, its more optimized
     let heights_bottom = vec3f(
-        textureLoad(heightmap, coords + vec2i(-1, -1), 0).r + textureLoad(water_sediment, coords + vec2i(-1, -1), 0).r * WATER_HEIGHT_FACTOR,
-        textureLoad(heightmap, coords + vec2i(0, -1), 0).r + textureLoad(water_sediment, coords + vec2i(0, -1), 0).r * WATER_HEIGHT_FACTOR,
-        textureLoad(heightmap, coords + vec2i(1, -1), 0).r + textureLoad(water_sediment, coords + vec2i(1, -1), 0).r * WATER_HEIGHT_FACTOR,
+        textureLoad(heightmap, coords + vec2i(-1, -1), 0).r,
+        textureLoad(heightmap, coords + vec2i(0, -1), 0).r,
+        textureLoad(heightmap, coords + vec2i(1, -1), 0).r,
     );
     let heights_center = vec3f(
-        textureLoad(heightmap, coords + vec2i(-1, 0), 0).r + textureLoad(water_sediment, coords + vec2i(-1, 0), 0).r * WATER_HEIGHT_FACTOR,
-        textureLoad(heightmap, coords + vec2i(0, 0), 0).r + water_sediment_here.r * WATER_HEIGHT_FACTOR,
-        textureLoad(heightmap, coords + vec2i(1, 0), 0).r + textureLoad(water_sediment, coords + vec2i(1, 0), 0).r * WATER_HEIGHT_FACTOR,
+        textureLoad(heightmap, coords + vec2i(-1, 0), 0).r,
+        textureLoad(heightmap, coords + vec2i(0, 0), 0).r,
+        textureLoad(heightmap, coords + vec2i(1, 0), 0).r,
     );
     let heights_top = vec3f(
-        textureLoad(heightmap, coords + vec2i(-1, 1), 0).r + textureLoad(water_sediment, coords + vec2i(-1, 1), 0).r * WATER_HEIGHT_FACTOR,
-        textureLoad(heightmap, coords + vec2i(0, 1), 0).r + textureLoad(water_sediment, coords + vec2i(0, 1), 0).r * WATER_HEIGHT_FACTOR,
-        textureLoad(heightmap, coords + vec2i(1, 1), 0).r + textureLoad(water_sediment, coords + vec2i(1, 1), 0).r * WATER_HEIGHT_FACTOR,
+        textureLoad(heightmap, coords + vec2i(-1, 1), 0).r,
+        textureLoad(heightmap, coords + vec2i(0, 1), 0).r,
+        textureLoad(heightmap, coords + vec2i(1, 1), 0).r,
     );
 
     let sobel_left = dot(vec3f(heights_bottom.x, heights_center.x, heights_top.x), SOBEL_KERNEL);
@@ -77,7 +89,8 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         half_texel,
         vec2f(1.0) - half_texel
     );
-    let neighbor_height = textureSampleLevel(heightmap, heightmap_sampler, downhill_uv, 0.0).r + textureSampleLevel(water_sediment, heightmap_sampler, downhill_uv, 0.0).r * WATER_HEIGHT_FACTOR;
+    // let neighbor_height = textureSampleLevel(heightmap, heightmap_sampler, downhill_uv, 0.0).r + textureSampleLevel(water_sediment, heightmap_sampler, downhill_uv, 0.0).r * WATER_HEIGHT_FACTOR;
+    let neighbor_height = textureSampleLevel(heightmap, heightmap_sampler, downhill_uv, 0.0).r;
     let height_here = heights_center.y;
     let delta_h = height_here - neighbor_height;
 
@@ -91,7 +104,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     var delta: f32 = 0.0;
     // if its true, its a weird sink where the uphill coordinate is lower
     // so try to fill in the sink
-    if (delta_h <= 0.0) {
+    if (delta_h < 0.0) {
         delta = sediment_here; // this gets clamped to delta h later anyways, so its never too large
     }
     else if (sediment_here > capacity) {
@@ -101,9 +114,11 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         delta = DISSOLVE_RATE * (sediment_here - capacity);
     }
 
-    delta = max(-max(delta_h, 0.0), delta);
+    // delta = max(-max(delta_h, 0.0), delta);
+    delta = clamp(delta, min(-SPIKE_LIMIT, -delta_h), max(SPIKE_LIMIT, -delta_h));
 
-    let new_height = delta + height_here - water_sediment_here.r * WATER_HEIGHT_FACTOR;
+    // let new_height = delta + height_here - water_sediment_here.r * WATER_HEIGHT_FACTOR;
+    let new_height = delta + height_here;
     textureStore(write_heightmap, coords, vec4f(new_height, 0.0, 0.0, 1.0));
 
     let new_sediment = sediment_here - delta;
