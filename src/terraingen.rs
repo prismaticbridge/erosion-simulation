@@ -15,10 +15,13 @@ const WORKGROUP_SIZE: u32 = 16;
 #[derive(Deserialize)]
 pub struct Config {
     pub chunk_size: u32,
+    pub pad_size: u32,
     pub iterations: u32,
     pub fbm_resolution: u32,
     pub fbm_octaves: u32,
     pub fbm_persistence: f64,
+    pub terrain_scale_vertical: f64,
+    pub terrain_height_offset: f64,
     pub save_intermediate_images: bool,
 }
 
@@ -360,10 +363,11 @@ pub fn generate_chunkable_fbm(
     base_res: (u32, u32),
     octaves: u32,
     persistence: f64,
-) -> Vec<f32> {
-    let mut total = vec![0.0 as f32; (shape.0 * shape.1) as usize];
+    offset: (i32, i32),
+) -> Vec<f64> {
+    let mut total = vec![0.0; (shape.0 * shape.1) as usize];
     let mut amplitude = 1.0;
-    let mut total_amplitude = 0.0;
+    // let mut total_amplitude = 0.0;
     let mut freq_mult = 1;
 
     let seed: u32 = rand::random();
@@ -377,16 +381,16 @@ pub fn generate_chunkable_fbm(
             for y in 0..shape.0 {
                 for x in 0..shape.1 {
                     // Map coordinates to the frequency resolution scale
-                    let nx = (x as f64 / shape.1 as f64) * res.1 as f64;
-                    let ny = (y as f64 / shape.0 as f64) * res.0 as f64;
+                    let nx = ((x as i32 + offset.0) as f64 / shape.1 as f64) * res.1 as f64;
+                    let ny = ((y as i32 + offset.1) as f64 / shape.0 as f64) * res.0 as f64;
                     let val = perlin.get([nx, ny]);
 
                     let idx = (y * shape.1 + x) as usize;
                     //graphics card needs f32
-                    total[idx] += (val * amplitude) as f32;
+                    total[idx] += val * amplitude;
                 }
             }
-            total_amplitude += amplitude;
+            // total_amplitude += amplitude;
         }
 
         amplitude *= persistence;
@@ -394,11 +398,11 @@ pub fn generate_chunkable_fbm(
     }
 
     // Normalize by total amplitude
-    if total_amplitude > 0.0 {
-        for val in total.iter_mut() {
-            *val /= total_amplitude as f32;
-        }
-    }
+    // if total_amplitude > 0.0 {
+    //     for val in total.iter_mut() {
+    //         *val /= total_amplitude as f32;
+    //     }
+    // }
 
     total
 }
@@ -702,7 +706,7 @@ impl TerrainGenContext {
             wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
         );
 
-        let mut heightmap_textures = [
+        let heightmap_textures = [
             create_2d_texture(
                 &gpu.device,
                 "terrain heightmap",
@@ -724,46 +728,46 @@ impl TerrainGenContext {
                     | wgpu::TextureUsages::STORAGE_BINDING,
             ),
         ];
-        {
-            let mut initial_heightmap = generate_chunkable_fbm(
-                (config.chunk_size, config.chunk_size),
-                (config.fbm_resolution, config.fbm_resolution),
-                config.fbm_octaves,
-                config.fbm_persistence,
-            );
-            // erosion.py normalizes the terrain to 0..1 before simulating, and
-            // the erosion constants assume that range.
-            let min = initial_heightmap
-                .iter()
-                .copied()
-                .fold(f32::INFINITY, f32::min);
-            let max = initial_heightmap
-                .iter()
-                .copied()
-                .fold(f32::NEG_INFINITY, f32::max);
-            if max > min {
-                for height in &mut initial_heightmap {
-                    *height = (*height - min) / (max - min);
-                }
-            }
-            let layout = get_layout_dimensions(&heightmap_textures[0]);
-            // The first texture is read from, so heightmap should start in that one
-            // Second texture starts blank but the first erosion pass will update it
-            upload_to_texture(&mut heightmap_textures[0], &initial_heightmap, &gpu, layout);
-            //save initial heightmap
-            let heightmap_u8: Vec<u8> = initial_heightmap
-                .iter()
-                .map(|h| (h * 255.0) as u8)
-                .collect();
-            image::save_buffer(
-                "initial_heightmap.png",
-                &heightmap_u8,
-                config.chunk_size,
-                config.chunk_size,
-                image::ExtendedColorType::L8,
-            )
-            .expect("Failed to save initial heightmap");
-        }
+        // {
+        //     let mut initial_heightmap = generate_chunkable_fbm(
+        //         (config.chunk_size, config.chunk_size),
+        //         (config.fbm_resolution, config.fbm_resolution),
+        //         config.fbm_octaves,
+        //         config.fbm_persistence,
+        //     );
+        //     // erosion.py normalizes the terrain to 0..1 before simulating, and
+        //     // the erosion constants assume that range.
+        //     let min = initial_heightmap
+        //         .iter()
+        //         .copied()
+        //         .fold(f32::INFINITY, f32::min);
+        //     let max = initial_heightmap
+        //         .iter()
+        //         .copied()
+        //         .fold(f32::NEG_INFINITY, f32::max);
+        //     if max > min {
+        //         for height in &mut initial_heightmap {
+        //             *height = (*height - min) / (max - min);
+        //         }
+        //     }
+        //     let layout = get_layout_dimensions(&heightmap_textures[0]);
+        //     // The first texture is read from, so heightmap should start in that one
+        //     // Second texture starts blank but the first erosion pass will update it
+        //     upload_to_texture(&mut heightmap_textures[0], &initial_heightmap, &gpu, layout);
+        //     //save initial heightmap
+        //     let heightmap_u8: Vec<u8> = initial_heightmap
+        //         .iter()
+        //         .map(|h| (h * 255.0) as u8)
+        //         .collect();
+        //     image::save_buffer(
+        //         "initial_heightmap.png",
+        //         &heightmap_u8,
+        //         config.chunk_size,
+        //         config.chunk_size,
+        //         image::ExtendedColorType::L8,
+        //     )
+        //     .expect("Failed to save initial heightmap");
+        // }
 
         // TODO delete COPY_SRC from both of these
         let mut water_sediment_textures = [
@@ -950,7 +954,39 @@ impl TerrainGenContext {
 
     // If an encoder is not provided, this will create one
     // This consumes the command encoder for reading data back to the cpu
-    pub fn run_chunk_generation(&mut self, encoder: Option<wgpu::CommandEncoder>) -> Vec<f32> {
+    pub fn run_chunk_generation(
+        &mut self,
+        encoder: Option<wgpu::CommandEncoder>,
+        offset: (i32, i32),
+    ) -> Vec<f32> {
+        let initial_heightmap: Vec<f32> = generate_chunkable_fbm(
+            (self.config.chunk_size, self.config.chunk_size),
+            (self.config.fbm_resolution, self.config.fbm_resolution),
+            self.config.fbm_octaves,
+            self.config.fbm_persistence,
+            offset,
+        )
+        .iter()
+        .map(|h| {
+            (h * self.config.terrain_scale_vertical + self.config.terrain_height_offset) as f32
+        })
+        .collect();
+        let layout_dimensions = get_layout_dimensions(&self.heightmap_textures[0]);
+        upload_to_texture(
+            &mut self.heightmap_textures[0],
+            &initial_heightmap,
+            &self.gpu,
+            layout_dimensions,
+        );
+        let min = initial_heightmap
+            .iter()
+            .copied()
+            .fold(f32::INFINITY, f32::min);
+        let max = initial_heightmap
+            .iter()
+            .copied()
+            .fold(f32::NEG_INFINITY, f32::max);
+        println!("initial heightmap min: {min}, max: {max}");
         let mut encoder =
             encoder.unwrap_or(self.gpu.device.create_command_encoder(&Default::default()));
         let mut pass = encoder.begin_compute_pass(&Default::default());
@@ -1084,6 +1120,13 @@ impl TerrainGenContext {
         );
 
         let output_floats: Vec<f32> = bytemuck::cast_slice(&output_data).into();
+
+        let min = output_floats.iter().copied().fold(f32::INFINITY, f32::min);
+        let max = output_floats
+            .iter()
+            .copied()
+            .fold(f32::NEG_INFINITY, f32::max);
+        println!("final heightmap min: {min}, max: {max}");
 
         //         let mut img: ImageBuffer<image::Luma<u16>, Vec<u16>> =
         //             ImageBuffer::new(layout_dimensions.width, layout_dimensions.height);

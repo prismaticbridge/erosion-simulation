@@ -1,6 +1,9 @@
 chunk_size: 1024
+pad_size: 128
 iterations: 512
 fbm_resolution: 4
 fbm_octaves: 6
 fbm_persistence: 0.45
+terrain_scale_vertical: 0.45
+terrain_height_offset: 0.5
 save_intermediate_images: false

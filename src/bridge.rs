@@ -7,7 +7,7 @@ use std::{
 };
 
 use glam::Vec2;
-use honeycomb_3d::{Renderer, ShaderConfig};
+use honeycomb_3d::{Renderer, ShaderConfig, utils::SurfaceError};
 use winit::{
     application::ApplicationHandler,
     event::{DeviceEvent, KeyEvent, WindowEvent},
@@ -270,7 +270,9 @@ impl ApplicationHandler for App {
                         let size = state.window.inner_size();
                         state.renderer.resize(size.width, size.height);
                     }
-                    Err(_) => eprintln!("Surface error"),
+                    Err(e) => {
+                        eprint!("Surface error: {}", e);
+                    }
                 }
             }
             WindowEvent::CursorMoved {

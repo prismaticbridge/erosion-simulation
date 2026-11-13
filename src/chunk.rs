@@ -1,11 +1,18 @@
-use std::hash::{Hash, Hasher};
+use std::{
+    hash::{Hash, Hasher},
+    num::NonZeroU32,
+};
 
 use glam::Vec3;
 use honeycomb_3d::vertex::Vertex;
 
+use crate::terraingen::Config;
+
 //size of each "block" or heightmap pixel
 pub const MAP_SCALE: f32 = 0.25;
 pub const WORLD_HEIGHT: f32 = 32.0;
+const SCALED_WATER_HEIGHT: f32 = WATER_HEIGHT * WORLD_HEIGHT;
+const ALPHA_SCALE_FACTOR: f32 = 4.0;
 
 pub struct Chunk {
     pub x: i32,
@@ -36,19 +43,21 @@ impl Hash for Chunk {
     }
 }
 
-const NUM_HILLSHADE_INTERVALS: usize = 4;
+const NUM_HILLSHADE_INTERVALS: usize = 5;
 //search this to find index to lookup table
-const HILLSHADING_THRESHOLDS: [f32; NUM_HILLSHADE_INTERVALS + 1] = [0.0, 0.25, 0.5, 0.8, 1.0];
+const HILLSHADING_THRESHOLDS: [f32; NUM_HILLSHADE_INTERVALS + 1] = [0.1, 0.2, 0.4, 0.6, 0.85, 1.0];
 //Lookup table to mapping heightmap values to terrain colors
-const HILLSHADING_COLORS: [[f32; 3]; NUM_HILLSHADE_INTERVALS + 1] = [
-    [0.15, 0.3, 0.15],
-    [0.3, 0.45, 0.3],
-    [0.5, 0.5, 0.35],
-    [0.4, 0.36, 0.33],
-    [1.0, 1.0, 1.0],
+const HILLSHADING_COLORS: [[f32; 4]; NUM_HILLSHADE_INTERVALS + 1] = [
+    [0.6, 0.6, 0.3, 1.0],
+    [0.15, 0.3, 0.15, 1.0],
+    [0.3, 0.45, 0.3, 1.0],
+    [0.5, 0.5, 0.35, 1.0],
+    [0.4, 0.36, 0.33, 1.0],
+    [1.0, 1.0, 1.0, 1.0],
 ];
+const WATER_HEIGHT: f32 = 0.2;
 
-fn map_to_color(height: f32) -> [f32; 3] {
+fn map_to_color(height: f32) -> [f32; 4] {
     if height <= HILLSHADING_THRESHOLDS[0] {
         return HILLSHADING_COLORS[0];
     }
@@ -73,6 +82,7 @@ fn map_to_color(height: f32) -> [f32; 3] {
         second[0] * lerp_value + first[0] * (1.0 - lerp_value),
         second[1] * lerp_value + first[1] * (1.0 - lerp_value),
         second[2] * lerp_value + first[2] * (1.0 - lerp_value),
+        1.0,
     ];
 
     color
@@ -83,7 +93,8 @@ impl Chunk {
         Self { x, y, heightmap }
     }
     //returns (vertices, indices, normals)
-    pub fn to_3d_geometry(&self, chunk_size: u32) -> (Vec<Vertex>, Vec<u32>) {
+    pub fn to_3d_geometry(&self, config: &Config) -> (Vec<Vertex>, Vec<u32>) {
+        let chunk_size = config.chunk_size;
         let mut geometry = Vec::<Vertex>::with_capacity((chunk_size * chunk_size) as usize);
         let mut indices =
             Vec::<u32>::with_capacity(((chunk_size - 1) * (chunk_size - 1) * 6) as usize);
@@ -92,19 +103,25 @@ impl Chunk {
         //this is confusing! x and y are texture indices
         //but the camera projection uses x and z as horizontal axes
         let chk_sz_i32: i32 = chunk_size as i32;
-        for y in 0..chk_sz_i32 as i32 {
-            for x in 0..chk_sz_i32 as i32 {
+        let offset_x = self.x * chk_sz_i32;
+        let offset_y = self.y * chk_sz_i32;
+        for y in 0..chk_sz_i32 {
+            for x in 0..chk_sz_i32 {
                 geometry.push(Vertex {
                     position: [
-                        ((x - chk_sz_i32 / 2) as f32) * MAP_SCALE,
+                        ((x - chk_sz_i32 / 2 + offset_x) as f32) * MAP_SCALE,
                         self.heightmap[(y * chk_sz_i32 + x) as usize] * WORLD_HEIGHT,
-                        ((y - chk_sz_i32 / 2) as f32) * MAP_SCALE,
+                        ((y - chk_sz_i32 / 2 + offset_y) as f32) * MAP_SCALE,
                     ],
                     color: map_to_color(self.heightmap[(y * chk_sz_i32 + x) as usize]),
                     normal: [0.0, 0.0, 0.0], // set these later
                 });
             }
         }
+
+        let mut water_pointer_matrix = vec![NonZeroU32::new(0); (chunk_size * chunk_size) as usize];
+        let mut water_indices: Vec<u32> = Vec::new();
+
         //build triangles
         for y in 0..chunk_size - 1 {
             for x in 0..chunk_size - 1 {
@@ -112,6 +129,73 @@ impl Chunk {
                 let topright = y * chunk_size + x + 1;
                 let bottomleft = (y + 1) * chunk_size + x;
                 let bottomright = (y + 1) * chunk_size + x + 1;
+
+                let topleft_v = Vec3::from_array(geometry[topleft as usize].position);
+                let topright_v = Vec3::from_array(geometry[topright as usize].position);
+                let bottomleft_v = Vec3::from_array(geometry[bottomleft as usize].position);
+                let bottomright_v = Vec3::from_array(geometry[bottomright as usize].position);
+
+                // build water
+                // triangle-plane intersection
+                // let mut valid_intersections = 0;
+                // let mut intersections = [Vec3::ZERO, Vec3::ZERO, Vec3::ZERO];
+                // for i in 0..3 {
+                //     let point_1 = triangle_1[i];
+                //     let point_2 = triangle_1[(i + 1) % 3];
+                //     let edge = point_2 - point_1;
+                //     //solving (point + t * edge).z = WATER_HEIGHT
+                //     let t = (WATER_HEIGHT - point_1.z) / edge.z;
+                //     let intersection = point_1 + t * edge;
+                //     //check if intersection is inside the edge
+                //     if (point_1.x <= intersection.x) != (point_2.x <= point_2.x) {
+                //         intersections[valid_intersections as usize] = intersection;
+                //         valid_intersections += 1;
+                //     }
+                // }
+                // I give up, will do bad implementation
+
+                let triangles = [
+                    [topleft, bottomleft, topright],
+                    [bottomright, topright, bottomleft],
+                ];
+
+                if topleft_v.y <= SCALED_WATER_HEIGHT
+                    || topright_v.y <= SCALED_WATER_HEIGHT
+                    || bottomleft_v.y <= SCALED_WATER_HEIGHT
+                    || bottomright_v.y <= SCALED_WATER_HEIGHT
+                {
+                    for triangle in triangles {
+                        for i in triangle {
+                            let vertex_ptr = water_pointer_matrix[i as usize];
+                            match vertex_ptr {
+                                None => {
+                                    let alpha = (WATER_HEIGHT - self.heightmap[i as usize])
+                                        * ALPHA_SCALE_FACTOR;
+                                    let index = geometry.len() as u32;
+                                    geometry.push(Vertex {
+                                        position: [
+                                            ((x as i32 - chk_sz_i32 / 2 + offset_x) as f32)
+                                                * MAP_SCALE,
+                                            SCALED_WATER_HEIGHT,
+                                            ((y as i32 - chk_sz_i32 / 2 + offset_y) as f32)
+                                                * MAP_SCALE,
+                                        ],
+                                        normal: [0.0, 1.0, 0.0],
+                                        color: [0.0, 0.0, 1.0, alpha],
+                                    });
+
+                                    water_indices.push(index);
+                                    water_pointer_matrix[i as usize] = NonZeroU32::new(index);
+                                }
+                                Some(ptr) => {
+                                    let index = ptr.get();
+                                    water_indices.push(index);
+                                }
+                            }
+                        }
+                    }
+                }
+
                 indices.extend([
                     topleft,
                     bottomleft,
@@ -120,10 +204,6 @@ impl Chunk {
                     topright,
                     bottomleft,
                 ]);
-                let topleft_v = Vec3::from_array(geometry[topleft as usize].position);
-                let topright_v = Vec3::from_array(geometry[topright as usize].position);
-                let bottomleft_v = Vec3::from_array(geometry[bottomleft as usize].position);
-                let bottomright_v = Vec3::from_array(geometry[bottomright as usize].position);
 
                 let normal = (bottomleft_v - topleft_v).cross(topright_v - topleft_v);
                 for i in 0..3 {
@@ -140,12 +220,15 @@ impl Chunk {
             }
         }
 
-        for vertex in &mut geometry {
+        for i in 0..(chunk_size * chunk_size) {
+            let vertex = &mut geometry[i as usize];
             let magnitude = Vec3::from_array(vertex.normal).length();
             vertex.normal[0] /= magnitude;
             vertex.normal[1] /= magnitude;
             vertex.normal[2] /= magnitude;
         }
+
+        indices.extend(water_indices);
 
         // print as output for a .obj file
         //for vertex in &geometry {

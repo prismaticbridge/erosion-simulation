@@ -1,7 +1,7 @@
 use std::{num::NonZero, sync::Arc};
 
 use glam::{Quat, Vec3};
-use honeycomb_3d::{buffer::GpuBuffer, GpuContext};
+use honeycomb_3d::{GpuContext, buffer::GpuBuffer};
 use winit::{event::ElementState, keyboard::KeyCode};
 
 use crate::{
@@ -16,10 +16,17 @@ const NUM_KEYCODES: usize = 256;
 const MOUSE_MOVE_FACTOR: f64 = 0.001;
 const MOUSE_MOVE_THRESHOLD: f64 = 1e-8;
 
-const MOVEMENT_SPEED: f32 = 10.0;
+const MOVEMENT_SPEED: f32 = 50.0;
 const MOVEMENT_PER_TICK: f32 = MOVEMENT_SPEED / UPDATE_HZ as f32;
 const LIGHT_DIRECTION: Vec3 = Vec3::new(-0.57735027, -0.57735027, -0.57735027);
+const FIX_CAMERA_ROLL_RATE: f32 = -1.0;
 // const LIGHT_DIRECTION: Vec3 = Vec3::new(1000.0, 0.0, 0.0);
+
+//local forward vector used in quaternion calculations
+//not needed but makes it less confusing imo
+const FORWARD_LOCAL: Vec3 = Vec3::NEG_Z;
+const RIGHT_LOCAL: Vec3 = Vec3::X;
+const UP_LOCAL: Vec3 = Vec3::Y;
 
 pub struct Game {
     shared_io: Arc<SharedInputOutput>,
@@ -41,9 +48,12 @@ impl Game {
         // }
         let gpu_context = renderer.get_gpu_context();
         let mut terrain_generator = TerrainGenContext::new(Arc::clone(&gpu_context));
-        let chunk_heightmap = terrain_generator.run_chunk_generation(None);
+        let chunk_heightmap = terrain_generator.run_chunk_generation(None, (0, 0));
         let terrain_chunk = Chunk::new(chunk_heightmap, 0, 0);
-        let (geometry, indices) = terrain_chunk.to_3d_geometry(terrain_generator.config.chunk_size);
+        let (geometry, indices) = terrain_chunk.to_3d_geometry(&terrain_generator.config);
+        println!("{}", indices.len());
+
+        renderer.add_static_object(main_scene, &geometry, &indices);
 
         let mut light_direction_buffer = GpuBuffer::new(
             Arc::clone(&gpu_context),
@@ -61,8 +71,6 @@ impl Game {
         }];
 
         renderer.add_static_bind_group(entries, 0);
-
-        renderer.add_static_object(main_scene, &geometry, &indices);
         if let Ok(mut rs) = shared_io.render_state.lock() {
             rs.scenes.push(SceneState::new());
         }
@@ -98,7 +106,26 @@ impl Game {
             local_axis,
             (mouse_move_magnitude * MOUSE_MOVE_FACTOR) as f32,
         );
-        self.camera_orientation = self.camera_orientation * transformation_quat;
+
+        let new_camera_orientation = self.camera_orientation * transformation_quat;
+
+        //define local frame vectors in global frame
+        let local_up_global = new_camera_orientation * UP_LOCAL;
+        let local_forward_global = new_camera_orientation * FORWARD_LOCAL;
+        let global_up_global = Vec3::Y;
+        //make a reference frame that is local frame with no roll
+        let local_right_noroll_global = local_forward_global.cross(global_up_global);
+        let local_up_noroll_global = local_right_noroll_global.cross(local_forward_global);
+        //extract sine and cosine from dot products
+        let sine_roll = local_up_global.dot(local_right_noroll_global);
+        let cosine_roll = local_up_global.dot(local_up_noroll_global);
+
+        let roll_angle = sine_roll.atan2(cosine_roll);
+        let unroll_offset = roll_angle * FIX_CAMERA_ROLL_RATE;
+
+        let local_unroll_quaternion = Quat::from_axis_angle(local_forward_global, unroll_offset);
+
+        self.camera_orientation = (local_unroll_quaternion * new_camera_orientation).normalize();
     }
 
     fn update_events(&mut self) {
@@ -124,11 +151,6 @@ impl Game {
     }
 
     fn update_input(&mut self) {
-        const FORWARD_LOCAL: Vec3 = Vec3 {
-            x: 0.0,
-            y: 0.0,
-            z: -1.0,
-        };
         if self.keyboard_input[KeyCode::KeyW as usize] {
             let forward_global = self.camera_orientation * FORWARD_LOCAL;
             self.camera_position += forward_global * MOVEMENT_PER_TICK;
